@@ -18,6 +18,8 @@ pub enum View {
     Plot(usize),
     /// What archon is and how to start, with the first steps as buttons
     Welcome,
+    /// Writing a robot file
+    RobotBuilder,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

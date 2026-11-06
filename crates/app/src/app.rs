@@ -10,7 +10,9 @@ use archon_core::profile::{FILE_NAME, Profile, RestartPolicy};
 use archon_core::source::{SourceId, SourceKind};
 use archon_msg::Registry;
 use archon_ros::{EchoSource, Graph, Ros, TopicState, Watcher};
-use egui::{Align2, CentralPanel, Context, Event, Id, Key, Modifiers, Order, Panel, RichText, TextEdit, Ui, vec2};
+use egui::{
+    Align2, CentralPanel, Color32, Context, Event, Id, Key, Modifiers, Order, Panel, RichText, TextEdit, Ui, vec2,
+};
 
 use crate::bench::{self, Port};
 use crate::bytes::{self, BytesState};
@@ -57,8 +59,10 @@ pub struct Startup {
     pub config: bench::Config,
     /// The port of this window's own discovery server, when it's isolated
     pub discovery: Option<u16>,
-    /// A firmware build to simulate on start
+    /// A firmware build or robot file to simulate on start
     pub simulate: Option<PathBuf>,
+    /// Agents and consoles to open on start, as a robot's isolated window is given them
+    pub attach: Vec<crate::robot::Attach>,
 }
 
 pub struct ArchonApp {
@@ -121,6 +125,8 @@ pub struct ArchonApp {
     picking: Option<Pick>,
     /// The port of this window's own discovery server, when it's isolated
     discovery: Option<u16>,
+    /// The robot file being written, in its view
+    builder: Option<crate::builder::Builder>,
     /// The board file of each simulator started here, to tell when another copy of a board would mix topics with it
     simulated: Vec<(SourceId, PathBuf)>,
     /// The arguments of the windows opened, in place of opening them
@@ -137,7 +143,16 @@ enum Pick {
     Agent(Vec<Port>),
     Serial(Vec<Port>),
     Can(Vec<Port>),
-    Firmware(Vec<bench::Firmware>),
+    Simulate(Vec<Simulatable>),
+    /// A build to add to the robot being written
+    RobotBoard(Vec<bench::Firmware>),
+}
+
+/// What Space n f can run
+enum Simulatable {
+    NewRobot,
+    Robot(crate::robot::Robot),
+    Build(bench::Firmware),
 }
 
 /// A source opened from inside archon, as it would be written to a profile
@@ -174,11 +189,13 @@ enum Deferred {
     SaveToProfile(usize),
     Unplot(usize, usize),
     Run(Command),
+    Builder(crate::builder::Action),
 }
 
 impl ArchonApp {
     pub fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
-        let Startup { profile, keymap, mut problems, with_ros, state_file, config, discovery, simulate } = startup;
+        let Startup { profile, keymap, mut problems, with_ros, state_file, config, discovery, simulate, attach } =
+            startup;
         set_text_sizes(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
@@ -267,6 +284,7 @@ impl ArchonApp {
             added: Vec::new(),
             discovery,
             simulated: Vec::new(),
+            builder: None,
             #[cfg(test)]
             spawned: Vec::new(),
         };
@@ -297,10 +315,23 @@ impl ArchonApp {
             app.restore(saved);
         }
         app.problems = problems;
+        for one in &attach {
+            app.attach(one);
+        }
         if let Some(image) = simulate {
-            match bench::Firmware::from_image(image.clone()) {
-                Some(firmware) => app.simulate(&firmware),
-                None => app.flash(format!("{} isn't a firmware image (a .uf2)", image.display()), true),
+            let home = dirs::home_dir().unwrap_or_default();
+            if image.extension().is_some_and(|e| e == "toml") {
+                match crate::robot::load(&image, crate::robot::titan_firmware_dir(&home).as_deref()) {
+                    Ok(robot) => app.simulate_robot(&robot),
+                    Err(why) => app.flash(why, true),
+                }
+            } else {
+                match bench::Firmware::from_image(image.clone()) {
+                    Some(firmware) => app.simulate(&firmware),
+                    None => {
+                        app.flash(format!("{} isn't a firmware image (a .uf2) or robot file", image.display()), true)
+                    }
+                }
             }
         }
         app
@@ -497,7 +528,7 @@ impl ArchonApp {
             View::Topics => Some(&mut self.table.filter),
             View::AllLogs => Some(&mut self.merged.filter),
             View::Source(id) if id < self.views.len() => Some(&mut self.views[id].filter),
-            View::Source(_) | View::Publish(_) | View::Plot(_) | View::Welcome => None,
+            View::Source(_) | View::Publish(_) | View::Plot(_) | View::Welcome | View::RobotBuilder => None,
         }
     }
 
@@ -591,6 +622,7 @@ impl ArchonApp {
             }
             Command::SaveBench => self.save_bench(),
             Command::Simulate => self.pick_firmware(),
+            Command::NewRobot => self.open_builder(),
             Command::OpenIsolated => self.open_isolated(None),
             Command::CopyRosEnv => match std::env::var("ROS_DISCOVERY_SERVER") {
                 Ok(server) => {
@@ -742,6 +774,27 @@ impl ArchonApp {
                 }
                 _ => {}
             },
+            View::RobotBuilder => match command {
+                Command::Send => self.save_robot(false),
+                Command::ToggleRepeat => self.save_robot(true),
+                Command::Remove => {
+                    if let Some(builder) = &mut self.builder {
+                        builder.remove_selected();
+                    }
+                }
+                Command::ScrollDown | Command::ScrollUp => {
+                    if let Some(builder) = &mut self.builder
+                        && !builder.boards.is_empty()
+                    {
+                        let last = builder.boards.len() - 1;
+                        builder.selected = match command {
+                            Command::ScrollDown => (builder.selected + 1).min(last),
+                            _ => builder.selected.saturating_sub(1),
+                        };
+                    }
+                }
+                _ => {}
+            },
             View::Plot(_) | View::Welcome => {}
         }
     }
@@ -799,8 +852,15 @@ impl ArchonApp {
         if let Some(image) = image {
             args.extend(["--simulate".to_owned(), image.display().to_string()]);
         }
+        let quiet = image.is_some();
+        self.open_window(args, quiet);
+    }
+
+    /// Opens another archon with these arguments; `quiet` leaves saying so to the caller
+    fn open_window(&mut self, args: Vec<String>, quiet: bool) {
         #[cfg(test)]
         {
+            let _ = quiet;
             self.spawned.push(args);
         }
         #[cfg(not(test))]
@@ -817,11 +877,141 @@ impl ArchonApp {
                     .spawn()
             });
             match spawned {
-                Ok(_) if image.is_none() => self.flash("opened an isolated window", false),
+                Ok(_) if !quiet => self.flash("opened an isolated window", false),
                 Ok(_) => {}
                 Err(e) => self.flash(format!("couldn't open another window: {e}"), true),
             }
         }
+    }
+
+    /// Opens an agent or console for a board or bus, and starts it
+    fn attach(&mut self, attach: &crate::robot::Attach) -> Option<SourceId> {
+        use crate::robot::Attach;
+        let process = |name: String, cmd: String| archon_core::profile::ProcessSpec {
+            name,
+            cmd,
+            cwd: None,
+            env: Default::default(),
+            autostart: true,
+            restart: RestartPolicy::OnFailure,
+        };
+        let spec = match attach {
+            Attach::Console { name, path } => {
+                let spec = archon_core::profile::SerialSpec {
+                    name: self.unique_name(&format!("console {name}")),
+                    port: path.display().to_string(),
+                    baud: 115_200,
+                    autostart: true,
+                    line_ending: Default::default(),
+                };
+                let source = archon_sources::serial::SerialSource::new(spec.clone());
+                let id = self.sup.add(&spec.name, Box::new(source), RestartPolicy::Never, true, "\n");
+                self.grow_views();
+                self.sup.start(id);
+                self.added.push(Added::Serial(spec));
+                return Some(id);
+            }
+            Attach::Agent { name, .. } | Attach::UdpAgent { name, .. } => {
+                let agent = match self.find_agent() {
+                    Ok(agent) => agent,
+                    Err(why) => {
+                        self.flash(why, true);
+                        return None;
+                    }
+                };
+                let cmd = match attach {
+                    // A simulated board's terminal appears once the simulator is up
+                    Attach::Agent { path, .. } => format!(
+                        "while [ ! -e {p} ]; do sleep 0.2; done; {}",
+                        bench::agent_command(&agent, &Port::Simulated(path.clone())),
+                        p = bench::quote(path)
+                    ),
+                    Attach::UdpAgent { port, .. } => bench::agent_command(&agent, &Port::Udp(*port)),
+                    Attach::Console { .. } => unreachable!(),
+                };
+                process(self.unique_name(&format!("agent {name}")), cmd)
+            }
+        };
+        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+        let id = self.sup.add(&spec.name, Box::new(source), spec.restart, true, "\n");
+        self.grow_views();
+        self.sup.start(id);
+        self.added.push(Added::Process(spec));
+        Some(id)
+    }
+
+    /// Runs a robot file: the simulator with every board, a console per C board, an agent for each USB board here
+    /// and one per CAN bus; a second copy of a USB board goes, with its console, to an isolated window
+    pub(crate) fn simulate_robot(&mut self, robot: &crate::robot::Robot) {
+        let simulator = match self.find_simulator().and_then(|s| self.find_agent().map(|_| s)) {
+            Ok(simulator) => simulator,
+            Err(why) => return self.flash(why, true),
+        };
+        if let Some(why) = robot.problem() {
+            return self.flash(format!("can't run {}: {why}", robot.name), true);
+        }
+        let base: String =
+            robot.name.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
+        let slug = (1..)
+            .map(|n| if n == 1 { base.clone() } else { format!("{base}{n}") })
+            .find(|s| !self.sup.entries().iter().any(|e| !e.removed && e.name == format!("robot {s}")))
+            .expect("unbounded");
+        let running: Vec<PathBuf> = self
+            .simulated
+            .iter()
+            .filter(|(id, _)| {
+                let entry = &self.sup.entries()[*id];
+                !entry.removed && entry.status.is_active()
+            })
+            .map(|(_, board)| board.clone())
+            .collect();
+        let mut taken = Vec::new();
+        let plan = crate::robot::plan(&simulator, robot, &slug, &running, || {
+            let port = crate::robot::free_udp_port(&taken);
+            taken.push(port);
+            port
+        });
+
+        let spec = archon_core::profile::ProcessSpec {
+            name: format!("robot {slug}"),
+            cmd: plan.command.clone(),
+            cwd: Some(simulator.checkout.clone()),
+            env: Default::default(),
+            autostart: true,
+            restart: RestartPolicy::Never,
+        };
+        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+        let sim = self.sup.add(&spec.name, Box::new(source), spec.restart, true, "\n");
+        self.grow_views();
+        self.sup.start(sim);
+        self.added.push(Added::Process(spec));
+        // The USB boards running here, so another copy of one goes elsewhere too
+        for attach in &plan.here {
+            if let crate::robot::Attach::Agent { name, .. } = attach
+                && let Some(board) = robot.boards.iter().find(|b| b.name == *name)
+            {
+                self.simulated.push((sim, board.board.clone()));
+            }
+        }
+        let mut first_console = None;
+        for attach in &plan.here {
+            let id = self.attach(attach);
+            if first_console.is_none() && matches!(attach, crate::robot::Attach::Console { .. }) {
+                first_console = id;
+            }
+        }
+        for window in &plan.windows {
+            let mut args = vec!["--isolated".to_owned()];
+            args.extend(window.iter().flat_map(|a| a.args()));
+            self.open_window(args, true);
+        }
+        self.show_view(View::Source(first_console.unwrap_or(sim)), false);
+        let elsewhere = match plan.windows.len() {
+            0 => String::new(),
+            1 => "; a second copy of a board runs in an isolated window".to_owned(),
+            n => format!("; further copies of its boards run in {n} isolated windows"),
+        };
+        self.flash(format!("running {} ({}){elsewhere}", robot.name, robot.board_names()), false);
     }
 
     /// Removes a source, asking first whether to take it out of the profile too when it's in there
@@ -1001,9 +1191,75 @@ impl ArchonApp {
 
     /// Lists the firmware builds to simulate, newest first
     fn pick_firmware(&mut self) {
-        if let Err(why) = self.find_simulator().and_then(|_| self.find_agent()) {
-            return self.flash(why, true);
+        let simulator = match self.find_simulator().and_then(|s| self.find_agent().map(|_| s)) {
+            Ok(simulator) => simulator,
+            Err(why) => return self.flash(why, true),
+        };
+        let home = dirs::home_dir().unwrap_or_default();
+        let robots = crate::robot::robots(&simulator, crate::robot::titan_firmware_dir(&home).as_deref());
+        let builds = bench::firmware_builds(&home);
+        if builds.is_empty() && robots.is_empty() {
+            return self
+                .flash("no titan_firmware builds found (looked for *_with_bl.uf2 under ~/dev/*/titan_firmware)", true);
         }
+        let ago = |built: Option<std::time::SystemTime>, what: &str| {
+            built.and_then(|t| t.elapsed().ok()).map(|age| {
+                let secs = age.as_secs();
+                match secs {
+                    0..3600 => format!("{what} {} min ago", secs / 60),
+                    3600..86400 => format!("{what} {} h ago", secs / 3600),
+                    _ => format!("{what} {} days ago", secs / 86400),
+                }
+            })
+        };
+        let mut items = vec![OptionItem {
+            label: "New robot…".to_owned(),
+            detail: "several boards in one simulation: pick them, archon writes the file".to_owned(),
+            hint: self.key_of(Command::NewRobot).unwrap_or_default(),
+        }];
+        let mut choices = vec![Simulatable::NewRobot];
+        for robot in robots {
+            let hint = match robot.problem() {
+                Some(_) => "not built".to_owned(),
+                None => ago(robot.modified, "robot, edited").unwrap_or_else(|| "robot".to_owned()),
+            };
+            items.push(OptionItem {
+                label: match robot.boards.len() {
+                    1 => format!("{} (1 board)", robot.name),
+                    n => format!("{} ({n} boards)", robot.name),
+                },
+                detail: robot.board_names(),
+                hint,
+            });
+            choices.push(Simulatable::Robot(robot));
+        }
+        for build in builds {
+            let dir = build.image.parent().map(|d| d.display().to_string()).unwrap_or_default();
+            items.push(OptionItem {
+                label: build.name.clone(),
+                detail: dir,
+                hint: ago(build.built, "built").unwrap_or_default(),
+            });
+            choices.push(Simulatable::Build(build));
+        }
+        self.picker = Some(Picker::options("Simulate a robot file, or one firmware build", items));
+        self.picking = Some(Pick::Simulate(choices));
+    }
+
+    /// Shows the robot file being written, starting one if there isn't one
+    fn open_builder(&mut self) {
+        let simulator = match self.find_simulator() {
+            Ok(simulator) => simulator,
+            Err(why) => return self.flash(why, true),
+        };
+        if self.builder.is_none() {
+            self.builder = Some(crate::builder::Builder::new(&simulator));
+        }
+        self.show_view(View::RobotBuilder, false);
+    }
+
+    /// Lists the firmware builds to add to the robot being written
+    fn pick_robot_board(&mut self) {
         let builds = bench::firmware_builds(&dirs::home_dir().unwrap_or_default());
         if builds.is_empty() {
             return self
@@ -1012,20 +1268,34 @@ impl ArchonApp {
         let items = builds
             .iter()
             .map(|f| {
-                let ago = f.built.and_then(|t| t.elapsed().ok()).map(|age| {
-                    let secs = age.as_secs();
-                    match secs {
-                        0..3600 => format!("built {} min ago", secs / 60),
-                        3600..86400 => format!("built {} h ago", secs / 3600),
-                        _ => format!("built {} days ago", secs / 86400),
-                    }
-                });
-                let dir = f.image.parent().map(|d| d.display().to_string()).unwrap_or_default();
-                OptionItem { label: f.name.clone(), detail: dir, hint: ago.unwrap_or_default() }
+                let transport = match crate::robot::transport(&f.image) {
+                    crate::robot::Transport::Usb => "micro-ROS over USB",
+                    crate::robot::Transport::Can => "micro-ROS over CAN",
+                    crate::robot::Transport::Other => "",
+                };
+                OptionItem {
+                    label: f.name.clone(),
+                    detail: f.image.parent().map(|d| d.display().to_string()).unwrap_or_default(),
+                    hint: transport.to_owned(),
+                }
             })
             .collect();
-        self.picker = Some(Picker::options("Simulate which firmware build?", items));
-        self.picking = Some(Pick::Firmware(builds));
+        self.picker = Some(Picker::options("Add which build to the robot?", items));
+        self.picking = Some(Pick::RobotBoard(builds));
+    }
+
+    /// Saves the robot being written, and runs it with `run`
+    fn save_robot(&mut self, run: bool) {
+        let home = dirs::home_dir().unwrap_or_default();
+        let Some(builder) = &mut self.builder else { return };
+        match builder.save(&home) {
+            Err(why) => self.flash(why, true),
+            Ok(path) if run => match crate::robot::load(&path, crate::robot::titan_firmware_dir(&home).as_deref()) {
+                Ok(robot) => self.simulate_robot(&robot),
+                Err(why) => self.flash(why, true),
+            },
+            Ok(path) => self.flash(format!("saved {}; run it from Space n f", path.display()), false),
+        }
     }
 
     /// Runs a build in the simulator, with the agent on its micro-ROS port and a console on its log port
@@ -1147,9 +1417,21 @@ impl ArchonApp {
                 let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
                 (Added::Process(spec), Box::new(source))
             }
-            Pick::Firmware(builds) => {
-                if let Some(firmware) = builds.get(index) {
-                    self.simulate(&firmware.clone());
+            Pick::RobotBoard(builds) => {
+                let Some(firmware) = builds.get(index).cloned() else { return };
+                let board = self.find_simulator().ok().and_then(|s| bench::board_for(&s, &firmware.image));
+                if let Some(builder) = &mut self.builder {
+                    builder.add(firmware, board);
+                }
+                self.show_view(View::RobotBuilder, false);
+                return;
+            }
+            Pick::Simulate(choices) => {
+                match choices.get(index) {
+                    Some(Simulatable::Build(firmware)) => self.simulate(&firmware.clone()),
+                    Some(Simulatable::Robot(robot)) => self.simulate_robot(&robot.clone()),
+                    Some(Simulatable::NewRobot) => self.open_builder(),
+                    None => {}
                 }
                 return;
             }
@@ -1611,6 +1893,23 @@ impl ArchonApp {
             View::Plot(_) => {
                 ui.label(RichText::new("This plot is gone").weak());
             }
+            View::RobotBuilder => {
+                let keys = [
+                    self.key_of(Command::Send).unwrap_or_default(),
+                    self.key_of(Command::ToggleRepeat).unwrap_or_default(),
+                    "a".to_owned(),
+                ];
+                let home = dirs::home_dir().unwrap_or_default();
+                match &mut self.builder {
+                    Some(builder) => {
+                        let keys = [keys[0].as_str(), keys[1].as_str(), keys[2].as_str()];
+                        if let Some(action) = crate::builder::show(ui, builder, &home, keys) {
+                            self.deferred.push(Deferred::Builder(action));
+                        }
+                    }
+                    None => _ = ui.label(RichText::new("No robot is being built (Space n r starts one)").weak()),
+                }
+            }
             View::Welcome => {
                 let agent = self.find_agent();
                 let (serial, can) = (bench::serial_ports(), bench::can_ports());
@@ -1650,6 +1949,9 @@ impl ArchonApp {
                 Deferred::SaveToProfile(i) => self.save_to_profile(i),
                 Deferred::Unplot(plot, series) => self.unplot(plot, series),
                 Deferred::Run(command) => self.run(command, ctx),
+                Deferred::Builder(crate::builder::Action::AddBoard) => self.pick_robot_board(),
+                Deferred::Builder(crate::builder::Action::Save) => self.save_robot(false),
+                Deferred::Builder(crate::builder::Action::SaveAndRun) => self.save_robot(true),
                 Deferred::ToggleBranch(id) => {
                     let _ = ctx;
                     let topic = self.topic_states[&id].clone();
@@ -1750,6 +2052,14 @@ impl ArchonApp {
                     (Command::MeasureAll, "measure all"),
                 ]);
             }
+            View::RobotBuilder => {
+                wanted.extend([
+                    (Command::Send, "save"),
+                    (Command::ToggleRepeat, "save and run"),
+                    (Command::ScrollDown, "move"),
+                    (Command::Remove, "remove board"),
+                ]);
+            }
             View::Welcome => {
                 wanted.extend([
                     (Command::StartAgent, "start the agent"),
@@ -1788,33 +2098,51 @@ impl ArchonApp {
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            let pending = self.matcher.pending();
-            if pending.is_empty() {
+        // The right end first (the profile, then any message), so the hints take only the room that's left and
+        // never run under a message
+        let hints = self.hints();
+        let pending = self.matcher.pending().to_vec();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let profile = self.profile_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy());
+            let profile = profile.unwrap_or("no profile".into());
+            ui.label(RichText::new(profile).small().weak())
+                .on_hover_text(self.profile_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
+            if self.timestamps {
+                ui.label(RichText::new("TIME").small().weak());
+            }
+            if let Some(flash) = &self.flash
+                && flash.at.elapsed() < FLASH_TIME
+            {
+                let color = if flash.bad { ui.visuals().error_fg_color } else { ui.visuals().strong_text_color() };
+                let width = ui.available_width() * 0.6;
+                ui.scope(|ui| {
+                    ui.set_max_width(width);
+                    ui.add(egui::Label::new(RichText::new(&flash.text).small().color(color)).truncate())
+                        .on_hover_text(&flash.text);
+                });
+                ui.ctx().request_repaint_after(FLASH_TIME);
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if !pending.is_empty() {
+                    ui.label(RichText::new(format!("{} …", format_sequence(&pending))).monospace().strong());
+                    ui.label(RichText::new("Esc cancels").small().weak());
+                    return;
+                }
                 let chip = ui.visuals().widgets.inactive.bg_fill;
-                for (keys, label) in self.hints() {
+                let font = egui::TextStyle::Small.resolve(ui.style());
+                let mono = egui::FontId::monospace(font.size);
+                for (keys, label) in hints {
+                    let wide = |text: String, font: egui::FontId| {
+                        ui.fonts_mut(|f| f.layout_no_wrap(text, font, Color32::WHITE).size().x)
+                    };
+                    let needed = wide(format!(" {keys} "), mono.clone()) + wide(label.to_owned(), font.clone()) + 16.0;
+                    if needed > ui.available_width() {
+                        break;
+                    }
                     ui.label(RichText::new(format!(" {keys} ")).monospace().small().background_color(chip));
                     ui.label(RichText::new(label).small().weak());
                     ui.add_space(6.0);
-                }
-            } else {
-                ui.label(RichText::new(format!("{} …", format_sequence(pending))).monospace().strong());
-                ui.label(RichText::new("Esc cancels").small().weak());
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let profile = self.profile_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy());
-                let profile = profile.unwrap_or("no profile".into());
-                ui.label(RichText::new(profile).small().weak())
-                    .on_hover_text(self.profile_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
-                if self.timestamps {
-                    ui.label(RichText::new("TIME").small().weak());
-                }
-                if let Some(flash) = &self.flash
-                    && flash.at.elapsed() < FLASH_TIME
-                {
-                    let color = if flash.bad { ui.visuals().error_fg_color } else { ui.visuals().strong_text_color() };
-                    ui.label(RichText::new(&flash.text).small().color(color));
-                    ui.ctx().request_repaint_after(FLASH_TIME);
                 }
             });
         });
@@ -2146,7 +2474,7 @@ impl ArchonApp {
                 }
                 View::AllLogs => PaneSpec::AllLogs,
                 View::Topics => PaneSpec::Topics,
-                View::Welcome => PaneSpec::Welcome,
+                View::Welcome | View::RobotBuilder => PaneSpec::Welcome,
                 View::Publish(i) => {
                     let p = &self.publishers[i];
                     PaneSpec::Publish { name: p.name.clone(), topic: p.topic.clone(), ty: p.ty.clone() }
@@ -2402,6 +2730,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -2878,6 +3207,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -2913,6 +3243,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -2973,6 +3304,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -3064,6 +3396,7 @@ mod tests {
                     config: Default::default(),
                     discovery: None,
                     simulate: None,
+                    attach: Vec::new(),
                 },
             )
         });
@@ -3161,6 +3494,7 @@ mod tests {
                     config,
                     discovery: None,
                     simulate: None,
+                    attach: Vec::new(),
                 },
             )
         });
@@ -3209,6 +3543,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -3252,6 +3587,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -3352,6 +3688,7 @@ mod tests {
                 config: Default::default(),
                 discovery: Some(port),
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -3482,6 +3819,7 @@ mod tests {
                 config: Default::default(),
                 discovery: None,
                 simulate: None,
+                attach: Vec::new(),
             };
             ArchonApp::new(cc, startup)
         });
@@ -3532,6 +3870,152 @@ mod tests {
             heard.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|n| n.trim().parse().ok()).collect();
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!got.is_empty(), "nothing crossed the pool");
+    }
+
+    /// A robot file with two IVCBoard2s in one pool: archon runs it, with talos_ivc's agent and console here and
+    /// surface_ivc's sent to an isolated window, which this test plays by running what that window would. Each
+    /// network then sees one board. Run alone: `cargo test -p archon runs_a_robot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn runs_a_robot_with_a_second_copy_isolated() {
+        use std::os::unix::process::CommandExt;
+        let home = dirs::home_dir().unwrap();
+        let simulator = bench::find_simulator(None, &home).unwrap();
+        let ivc =
+            bench::firmware_builds(&home).into_iter().find(|f| f.name == "IVCBoard2").expect("an IVCBoard2 build");
+        let dir = std::env::temp_dir().join(format!("archon-robot-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = simulator.checkout.join("boards/talos/ivc_board.toml");
+        let file = dir.join("two_ivc.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "[environment]\nfile = \"{env}\"\n\n[[bus]]\nname = \"talos\"\n\n[[bus]]\nname = \"surface\"\n\n\
+                 [[board]]\nname = \"talos_ivc\"\nboard = \"{board}\"\nelf = \"{elf}\"\nrom_boot = true\nbus = \"talos\"\n\
+                 position_m = [2.0, 6.0, 1.0]\n\n\
+                 [[board]]\nname = \"surface_ivc\"\nboard = \"{board}\"\nelf = \"{elf}\"\nrom_boot = true\n\
+                 bus = \"surface\"\npower_on_ms = 37\nposition_m = [7.0, 6.0, 1.0]\n",
+                env = simulator.checkout.join("environments/pool.toml").display(),
+                board = board.display(),
+                elf = ivc.image.display(),
+            ),
+        )
+        .unwrap();
+        let robot = crate::robot::load(&file, None).unwrap();
+
+        let mut h = Harness::builder().with_size(vec2(1200.0, 700.0)).build_eframe(move |cc| {
+            let startup = Startup {
+                profile: Profile::default(),
+                keymap: Keymap::defaults(),
+                problems: Vec::new(),
+                with_ros: true,
+                state_file: None,
+                config: Default::default(),
+                discovery: None,
+                simulate: None,
+                attach: Vec::new(),
+            };
+            ArchonApp::new(cc, startup)
+        });
+        h.run_steps(2);
+        h.state_mut().simulate_robot(&robot);
+        let names: Vec<String> = h.state().sup.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["robot twoivc", "agent talos_ivc", "console talos_ivc"]);
+        let window = h.state().spawned.last().cloned().expect("an isolated window for surface_ivc");
+        println!("isolated window: archon {}", window.join(" "));
+        assert_eq!(window[0], "--isolated");
+        let attach: Vec<crate::robot::Attach> =
+            window[1..].chunks(2).map(|pair| crate::robot::Attach::parse(&pair[0], &pair[1]).unwrap()).collect();
+        let Some(crate::robot::Attach::Agent { name, path }) = attach.first() else { panic!("{attach:?}") };
+        assert_eq!(name, "surface_ivc");
+
+        // What the isolated window runs: surface_ivc's agent on a discovery server of its own
+        let port = bench::free_discovery_port().unwrap();
+        let agent = bench::find_agent(None, &home).unwrap();
+        let script = format!(
+            "fast-discovery-server -i 0 -l 127.0.0.1 -p {port} > /dev/null 2>&1 &\n\
+             while [ ! -e {p} ]; do sleep 0.2; done\n\
+             export ROS_DISCOVERY_SERVER=127.0.0.1:{port}; {agent} > {dir}/agent_b.out 2>&1 &\nwait\n",
+            p = bench::quote(path),
+            agent = bench::agent_command(&agent, &Port::Simulated(path.clone())),
+            dir = dir.display(),
+        );
+        let mut other = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .env_remove("ROS_DISCOVERY_SERVER")
+            .env_remove("ROS_SUPER_CLIENT")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let heartbeats_isolated = || {
+            let out = std::process::Command::new("ros2")
+                .args(["topic", "info", "/talos/heartbeat", "--no-daemon"])
+                .env("ROS_DISCOVERY_SERVER", format!("127.0.0.1:{port}"))
+                .env("ROS_SUPER_CLIENT", "TRUE")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.lines().find_map(|l| l.strip_prefix("Publisher count: ")).and_then(|n| n.trim().parse::<usize>().ok())
+        };
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let (mut here, mut there) = (None, None);
+        while Instant::now() < deadline && !(here == Some(1) && there == Some(1)) {
+            h.run_steps(1);
+            here = h.state().graph.topic("/talos/heartbeat").map(|t| t.publishers);
+            there = heartbeats_isolated();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let console = h.state().sup.entries()[2].buffer.total();
+        println!("here: {here:?} heartbeat publishers; isolated: {there:?}; talos_ivc console lines: {console}");
+        h.state_mut().sup.stop_all();
+        // SAFETY: signalling the process group this test started
+        unsafe { libc::killpg(other.id() as i32, libc::SIGTERM) };
+        let _ = other.wait();
+        assert_eq!(here, Some(1), "this window sees talos_ivc only");
+        assert_eq!(there, Some(1), "the isolated network sees surface_ivc only");
+    }
+
+    /// Space n r, a twice, Ctrl+S: a robot file with two IVCBoard2s that the simulator runs
+    #[test]
+    fn builds_a_robot_file_the_simulator_runs() {
+        let home = dirs::home_dir().unwrap();
+        let (Ok(simulator), true) =
+            (bench::find_simulator(None, &home), bench::firmware_builds(&home).iter().any(|f| f.name == "IVCBoard2"))
+        else {
+            return;
+        };
+        // A checkout of links to the real boards and environments, so the file lands somewhere disposable
+        let checkout = std::env::temp_dir().join(format!("archon-built-robot-{}", std::process::id()));
+        std::fs::create_dir_all(checkout.join("robots")).unwrap();
+        for dir in ["boards", "environments"] {
+            let _ = std::os::unix::fs::symlink(simulator.checkout.join(dir), checkout.join(dir));
+        }
+        let mut h = harness();
+        keys(&mut h, "space n r");
+        assert_eq!(h.state().layout.active_view(), View::RobotBuilder);
+        h.state_mut().builder.as_mut().unwrap().checkout = checkout.clone();
+        for _ in 0..2 {
+            keys(&mut h, "a");
+            assert!(h.state().picker.is_some(), "a lists the builds");
+            type_text(&mut h, "IVCBoard2");
+            press(&mut h, Modifiers::NONE, Key::Enter);
+        }
+        let builder = h.state().builder.as_ref().unwrap();
+        assert_eq!(builder.boards.len(), 2);
+        assert!(builder.boards.iter().all(|b| b.transport == crate::robot::Transport::Usb && b.board.is_some()));
+        keys(&mut h, "ctrl+s");
+        let file = checkout.join("robots/my_ivcboard2_test.toml");
+        assert!(file.is_file(), "{:?}", h.state().flash.as_ref().map(|f| f.text.clone()));
+
+        // The simulator takes it: both boards boot in the pool
+        let out = std::process::Command::new(&simulator.binary)
+            .args(["robot", &file.display().to_string(), "--time", "20ms"])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{text}");
+        let _ = std::fs::remove_dir_all(&checkout);
     }
 
     #[test]
@@ -3591,7 +4075,22 @@ mod tests {
             keys(&mut welcome, "escape");
             keys(&mut welcome, "space n f");
             save(&mut welcome, "firmware-picker");
+            keys(&mut welcome, "escape");
+            // The robot builder with two IVCs and an ESC board, when there are builds to show
+            let home = dirs::home_dir().unwrap();
+            let builds = bench::firmware_builds(&home);
+            if let Ok(simulator) = bench::find_simulator(None, &home) {
+                keys(&mut welcome, "space n r");
+                for name in ["IVCBoard2", "IVCBoard2", "esc_board"] {
+                    if let Some(build) = builds.iter().find(|b| b.name == name) {
+                        let board = bench::board_for(&simulator, &build.image);
+                        welcome.state_mut().builder.as_mut().unwrap().add(build.clone(), board);
+                    }
+                }
+                save(&mut welcome, "robot-builder");
+            }
         }
+        {}
         // The question a removal asks when the source is in the profile
         h.state_mut().profile_path = Some("archon.toml".into());
         h.state_mut().removing = Some((Removal::Source(1), "board".into()));

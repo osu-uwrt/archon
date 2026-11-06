@@ -217,6 +217,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("space n a", "bench.agent"),
     ("space n s", "bench.serial"),
     ("space n f", "bench.simulate"),
+    ("space n r", "bench.new_robot"),
     ("space n i", "bench.isolated"),
     ("space n c", "bench.can"),
     ("space n w", "bench.save"),

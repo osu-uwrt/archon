@@ -89,6 +89,8 @@ pub enum Command {
     StartAgent,
     /// Run a firmware build in firmware_simulator, with the agent and a console on it
     Simulate,
+    /// Write a firmware_simulator robot file from the builds
+    NewRobot,
     OpenSerial,
     OpenCan,
     /// Write what's been opened into the profile, making one if there isn't one
@@ -182,7 +184,8 @@ pub const COMMANDS: &[CommandInfo] = &[
     c(Plot, "view.plot", "Plot the selected field"),
     c(RecordBag, "bag.record", "Record a bag of every topic"),
     c(StartAgent, "bench.agent", "Start the micro-ROS agent"),
-    c(Simulate, "bench.simulate", "Simulate a board in firmware_simulator"),
+    c(Simulate, "bench.simulate", "Simulate a board or robot in firmware_simulator"),
+    c(NewRobot, "bench.new_robot", "Build a robot file (several simulated boards)"),
     c(OpenSerial, "bench.serial", "Open a serial console"),
     c(OpenCan, "bench.can", "Dump a CAN bus"),
     c(SaveBench, "bench.save", "Save the bench to archon.toml"),

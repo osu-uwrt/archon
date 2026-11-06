@@ -2,6 +2,7 @@
 
 mod app;
 mod bench;
+mod builder;
 mod bytes;
 mod health;
 mod inspector;
@@ -12,6 +13,8 @@ mod persist;
 mod picker;
 mod plot;
 mod publish;
+mod rainbow;
+mod robot;
 mod sidebar;
 mod topics;
 mod welcome;
@@ -21,13 +24,17 @@ use std::path::PathBuf;
 use archon_core::profile::Profile;
 
 const USAGE: &str = "\
-usage: archon [--no-ros] [--isolated] [--simulate IMAGE] [PROFILE]
+usage: archon [--no-ros] [--isolated] [--simulate IMAGE|ROBOT] [--agent NAME=PORT] [--console NAME=PORT] [PROFILE]
 
 Runs the test bench in PROFILE, or in the nearest archon.toml in this directory or above.
 --no-ros          leaves out the ROS graph (topics and echoes).
 --isolated        runs on a ROS network of this window's own (a Fast DDS discovery server it starts), so two boards
                   with the same topics, each in its own window, don't mix. Without PROFILE it starts empty.
---simulate IMAGE  simulates a firmware build (a *_with_bl.uf2) on start, as Space n f does.
+--simulate IMAGE  simulates a firmware build (a *_with_bl.uf2), or a firmware_simulator robot file (a .toml), on
+                  start, as Space n f does.
+--agent NAME=PORT, --console NAME=PORT, --udp-agent NAME=UDP_PORT
+                  run a micro-ROS agent on a serial port (waiting for it to appear), open a console on one, or run
+                  an agent on a UDP port; repeatable. A robot's isolated windows are opened with these.
 Keybindings can be changed in ~/.config/archon/keymap.toml.";
 
 fn main() -> eframe::Result {
@@ -38,22 +45,34 @@ fn main() -> eframe::Result {
     }
     let with_ros = !args.iter().any(|a| a == "--no-ros");
     let isolated = args.iter().any(|a| a == "--isolated");
-    let simulate = args.iter().position(|a| a == "--simulate").map(|at| {
-        let image = args.get(at + 1).map(PathBuf::from);
-        args.drain(at..(at + 2).min(args.len()));
-        image
-    });
     args.retain(|a| a != "--no-ros" && a != "--isolated");
+    // The flags that take a value
+    let (mut simulate, mut attach, mut rest) = (None, Vec::new(), Vec::new());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if !matches!(arg.as_str(), "--simulate" | "--agent" | "--console" | "--udp-agent") {
+            rest.push(arg);
+            continue;
+        }
+        let Some(value) = iter.next() else {
+            eprintln!("{arg} needs a value\n\n{USAGE}");
+            std::process::exit(2);
+        };
+        if arg == "--simulate" {
+            simulate = Some(PathBuf::from(value));
+            continue;
+        }
+        match robot::Attach::parse(&arg, &value) {
+            Ok(one) => attach.push(one),
+            Err(why) => {
+                eprintln!("{why}\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let args = rest;
 
     let mut problems = Vec::new();
-    let simulate = match simulate {
-        Some(None) => {
-            eprintln!("--simulate needs a firmware image\n\n{USAGE}");
-            std::process::exit(2);
-        }
-        Some(Some(image)) => Some(image),
-        None => None,
-    };
     let path = match args.first() {
         Some(path) => Some(PathBuf::from(path)),
         // An isolated window is for a second board, so it doesn't bring up this folder's bench again
@@ -154,7 +173,8 @@ fn main() -> eframe::Result {
                 (None, Some(_)) => None,
                 (path, _) => persist::state_file(path.as_deref()),
             };
-            let startup = app::Startup { profile, keymap, problems, with_ros, state_file, config, discovery, simulate };
+            let startup =
+                app::Startup { profile, keymap, problems, with_ros, state_file, config, discovery, simulate, attach };
             Ok(Box::new(app::ArchonApp::new(cc, startup)))
         }),
     )

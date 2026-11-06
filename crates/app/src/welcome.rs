@@ -80,13 +80,13 @@ pub fn show(ui: &mut Ui, facts: &Facts<'_>, key: &dyn Fn(Command) -> String) -> 
         let simulator = match &facts.simulator {
             Ok(checkout) => format!(
                 "No board on the desk? Runs a titan_firmware build in firmware_simulator ({checkout}), with the agent \
-                 and its console attached, like a board on USB. A second copy of a board opens in a window of its \
-                 own ({}), so the two boards' topics don't mix.",
-                key(Command::OpenIsolated)
+                 and its console attached, like a board on USB, or a robot file with several boards ({} builds one). \
+                 A second copy of a board opens in a window of its own, so the two boards' topics don't mix.",
+                key(Command::NewRobot)
             ),
             Err(why) => format!("No board on the desk? Runs a titan_firmware build in firmware_simulator. {why}"),
         };
-        step(ui, "Or simulate a board", &simulator, Command::Simulate, "Simulate a board");
+        step(ui, "Or simulate a board or a robot", &simulator, Command::Simulate, "Simulate");
         step(ui, "Look at the topics", &ros, Command::OpenTopics, "Show topics");
         let save = match (facts.profile, facts.unsaved) {
             (Some(path), 0) => format!("This bench comes from {path}."),

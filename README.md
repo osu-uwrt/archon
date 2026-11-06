@@ -124,7 +124,8 @@ rest of a sequence with a menu of what can follow.
 | `Ctrl+W v` / `Ctrl+W s` / `Ctrl+W q` | Split right / split down / close the pane (also `Space w …`) |
 | `Ctrl+W h/j/k/l` or `Alt+h/j/k/l` | Move to the pane in that direction; `Ctrl+W w` cycles |
 | `Space n a` / `Space n s` / `Space n c` | Start the micro-ROS agent / open a serial console / dump a CAN bus |
-| `Space n f` | Simulate a board in firmware_simulator, with its agent and console |
+| `Space n f` | Simulate a robot file or one firmware build in firmware_simulator, with agents and consoles |
+| `Space n r` | Build a robot file (see [Robots](#robots-several-simulated-boards-at-once)) |
 | `Space n i` | Open an isolated window, on a ROS network of its own (see [Several boards at once](#several-boards-at-once)) |
 | `Space n w` | Save what's open to `archon.toml` |
 | `Delete` / `Space s d` | Remove the source or publisher (also in its right-click menu); if it's in the profile, `y` takes it out of the file too, `n` just for now |
@@ -163,6 +164,27 @@ board that's already simulated in the window (`Space n f`) opens the copy in an 
 To use `ros2` on an isolated window's network from a terminal, run `Copy this window's ROS environment` from the
 palette and paste it there; then use `ros2 ... --no-daemon` (the daemon stays on the network it started on). An
 isolated window with no profile given starts empty rather than loading this folder's `archon.toml`.
+
+## Robots: several simulated boards at once
+
+A firmware_simulator robot file runs several boards in one simulation, on shared CAN buses and in one body of water
+(two IVC boards only hear each other in the same run). `Space n f` lists the simulator's `robots/` files above the
+single builds, newest first; picking one runs it with:
+
+- a console on every C board's log;
+- an agent for each board on micro-ROS over USB (IVCBoard2), and one UDP agent per CAN bus whose boards speak
+  micro-ROS over CAN (the simulator hands the bus's sessions to it). archon tells the two apart from the symbols in
+  the `.elf` beside each `_with_bl.uf2`;
+- a second copy of a USB board, with its console, in an isolated window (`archon --isolated --agent NAME=PORT
+  --console NAME=PORT`), so the copies' identical topics stay apart.
+
+`TITAN_FIRMWARE_DIR` in a robot file falls back to your titan_firmware checkout when it isn't set. A robot whose
+images aren't built shows as "not built".
+
+**Writing one:** "New robot…" at the top of `Space n f`, or `Space n r`, opens the robot builder. `a` adds a build;
+archon matches it to its board file, names it, and fills in a bus and (for IVC boards, in the pool) a position 5 m
+from the last. Edit any of it; the file shows below as it'll be written. `Ctrl+S` saves it to the simulator's
+`robots/`, `Ctrl+R` saves and runs it.
 
 ## Layout
 
