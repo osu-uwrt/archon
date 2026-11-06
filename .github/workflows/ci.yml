@@ -1,0 +1,30 @@
+# Formatting, lints and tests, in the same Nix dev shell as local work
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          # The ROS packages and the team's messages come prebuilt from these
+          extra_nix_config: |
+            extra-substituters = https://ros.cachix.org https://uwrt.cachix.org
+            extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo= uwrt.cachix.org-1:8jsEBONNUB05TKTqyzw8rWFHZ8cKaBc4PagJJI09qco=
+      - uses: Swatinem/rust-cache@v2
+      - name: Dev shell
+        run: nix develop -c cargo --version
+      - name: Format
+        run: nix develop -c cargo fmt --all --check
+      - name: Clippy
+        run: nix develop -c cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        # Tests that need hardware, a firmware_simulator checkout or a display are #[ignore]d or skip themselves
+        run: nix develop -c cargo test --locked

@@ -1,16 +1,58 @@
 # archon
 
+[![CI](https://github.com/ATK422/archon/actions/workflows/ci.yml/badge.svg)](https://github.com/ATK422/archon/actions/workflows/ci.yml)
+
 A keyboard-driven native GUI for ROS 2 firmware testing, so a test session is one window instead of eleven terminals.
 It runs the micro-ROS agent and your other long-running commands, keeps your boards' serial consoles open across
 reflashes, shows every topic with its rate, and inspects messages as they change, firmware messages included, without
 generated code.
 
-## Running it
+## Installing
+
+**Download** (Linux x86_64, ROS 2 Humble): get `archon-…-x86_64-linux-ros-humble.tar.gz` from the
+[latest release](https://github.com/ATK422/archon/releases/latest), then:
 
 ```sh
-nix develop            # or let direnv load the flake
+tar xzf archon-*-x86_64-linux-ros-humble.tar.gz
+```
+
+```sh
+source /opt/ros/humble/setup.bash
+```
+
+```sh
+./archon-*/archon
+```
+
+It's built on Ubuntu 22.04 against ROS 2 Humble from apt (`ros-humble-ros-core` is enough to run it), so any
+newer Ubuntu with Humble works. Sourcing ROS first matters: archon loads ROS's libraries, and every message type it
+decodes, from that environment. Optional, for the features that use them: the micro-ROS agent, `rosbag2` (bags),
+titan_firmware's `upload_tool` (flashing), and firmware_simulator.
+
+**From source with Nix** (how UWRT works on it; CI uses the same shell):
+
+```sh
+nix develop
+```
+
+```sh
 cargo run --release
 ```
+
+**From source without Nix** (Ubuntu with ROS 2 Humble, plus `libclang-dev` and a Rust toolchain from rustup):
+
+```sh
+source /opt/ros/humble/setup.bash
+```
+
+```sh
+cargo build --release
+```
+
+## Running it
+
+`archon` in a folder with an `archon.toml` (or below one) brings that bench up; `archon path/to/bench.toml` runs a
+particular one.
 
 With nothing set up, archon opens on **Getting started**:
 

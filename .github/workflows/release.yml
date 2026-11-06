@@ -1,0 +1,49 @@
+# The download: built on Ubuntu 22.04 against ROS 2 Humble from apt, the setup ROS users have, so it runs with
+# `source /opt/ros/humble/setup.bash` and no Nix. A v* tag publishes it as a GitHub release; every run keeps it as
+# an artifact.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: ros:humble-ros-core
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential curl ca-certificates git libclang-dev pkg-config
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          cargo build --release --locked -p archon
+      - name: Package
+        shell: bash
+        run: |
+          name="archon-${GITHUB_REF_NAME//\//-}-x86_64-linux-ros-humble"
+          mkdir -p "dist/$name"
+          cp target/release/archon README.md LICENSE archon.example.toml "dist/$name/"
+          cp -r examples "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "ARCHIVE=dist/$name.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archon-x86_64-linux-ros-humble
+          path: ${{ env.ARCHIVE }}
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: ${{ env.ARCHIVE }}
+          generate_release_notes: true
