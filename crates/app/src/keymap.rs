@@ -159,6 +159,8 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("space s s", "source.start"),
     ("space s x", "source.stop"),
     ("space s r", "source.restart"),
+    ("space s d", "source.remove"),
+    ("delete", "source.remove"),
     ("space s a", "source.start_all"),
     ("space s q", "source.stop_all"),
     ("space s i", "source.input"),
@@ -189,11 +191,60 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("space v /", "view.search"),
     ("space v n", "view.search_clear"),
     ("space v y", "view.copy"),
-    // Panes
+    ("v", "view.mode"),
+    ("enter", "view.activate"),
+    ("ctrl+enter", "view.activate_beside"),
+    ("l", "view.expand"),
+    ("right", "view.expand"),
+    ("h", "view.collapse"),
+    ("left", "view.collapse"),
+    // Views
+    ("L", "open.logs"),
+    ("T", "open.topics"),
+    ("space o l", "open.logs"),
+    ("space o t", "open.topics"),
+    ("m", "topics.measure"),
+    ("w", "topics.watch"),
+    ("P", "topics.publish"),
+    ("ctrl+o", "topics.publish_any"),
+    ("space o p", "topics.publish_any"),
+    ("ctrl+s", "publish.send"),
+    ("ctrl+r", "publish.repeat"),
+    ("p", "view.plot"),
+    ("]", "plot.wider"),
+    ("[", "plot.narrower"),
+    ("space b", "bag.record"),
+    ("space n a", "bench.agent"),
+    ("space n s", "bench.serial"),
+    ("space n f", "bench.simulate"),
+    ("space n i", "bench.isolated"),
+    ("space n c", "bench.can"),
+    ("space n w", "bench.save"),
+    ("F1", "help.start"),
+    ("space l s", "layout.save"),
+    ("space l l", "layout.load"),
+    // Panes, as vim windows
     ("ctrl+w v", "pane.split"),
+    ("ctrl+w s", "pane.split_down"),
+    ("ctrl+w q", "pane.close"),
+    ("ctrl+w c", "pane.close"),
     ("ctrl+w w", "pane.other"),
+    ("ctrl+w h", "pane.left"),
+    ("ctrl+w j", "pane.down"),
+    ("ctrl+w k", "pane.up"),
+    ("ctrl+w l", "pane.right"),
+    ("alt+h", "pane.left"),
+    ("alt+j", "pane.down"),
+    ("alt+k", "pane.up"),
+    ("alt+l", "pane.right"),
     ("space w v", "pane.split"),
+    ("space w s", "pane.split_down"),
+    ("space w q", "pane.close"),
     ("space w w", "pane.other"),
+    ("space w h", "pane.left"),
+    ("space w j", "pane.down"),
+    ("space w k", "pane.up"),
+    ("space w l", "pane.right"),
 ];
 
 /// Names for prefixes, shown in the which-key popup
@@ -202,6 +253,9 @@ const GROUPS: &[(&str, &str)] = &[
     ("space s", "source"),
     ("space v", "view"),
     ("space w", "pane"),
+    ("space o", "open"),
+    ("space l", "layout"),
+    ("space n", "new"),
     ("ctrl+w", "pane"),
     ("g", "go"),
 ];
@@ -253,6 +307,12 @@ impl Keymap {
             }
         }
         Ok(())
+    }
+
+    /// Binds keys to a command in addition to what's bound already, replacing what those keys did
+    pub fn bind(&mut self, sequence: Sequence, command: Command) {
+        self.bindings.retain(|(bound, _)| *bound != sequence);
+        self.bindings.push((sequence, command));
     }
 
     pub fn lookup(&self, sequence: &[Chord]) -> Option<Command> {

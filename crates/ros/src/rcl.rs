@@ -17,11 +17,22 @@ use crate::{Callback, Command, Delivery, Graph, Options, SubscriptionId, Topic};
 /// How long a wait for messages lasts, which bounds how late a command is handled
 const WAIT: Duration = Duration::from_millis(20);
 const GRAPH_EVERY: Duration = Duration::from_millis(1000);
+/// How long a message waits for a subscriber to match its publisher. A new publisher's first messages would
+/// otherwise go out before discovery is done, to nobody: subscriptions are volatile, so they're lost.
+const MATCH_WAIT: Duration = Duration::from_secs(2);
+
+/// A message waiting for its publisher to have a subscriber
+struct Pending {
+    key: (String, String),
+    bytes: Vec<u8>,
+    since: Instant,
+}
 
 pub fn run(
     options: Options,
     commands: Receiver<Command>,
     graph: Arc<Mutex<Arc<Graph>>>,
+    errors: Arc<Mutex<Vec<String>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
     ready: Sender<anyhow::Result<()>>,
 ) {
@@ -37,6 +48,10 @@ pub fn run(
     };
     let mut types = TypeSupports::default();
     let mut subscriptions: HashMap<SubscriptionId, Subscription> = HashMap::new();
+    let mut publishers: HashMap<(String, String), Box<rcl_publisher_t>> = HashMap::new();
+    let mut pending: Vec<Pending> = Vec::new();
+    // Topics already reported as having nothing subscribed, so a steady rate doesn't repeat it
+    let mut unheard: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut wait_set = WaitSet::default();
     let mut last_graph: Option<Instant> = None;
 
@@ -56,9 +71,28 @@ pub fn run(
                         node.unsubscribe(subscription.handle);
                     }
                 }
+                Ok(Command::Advertise { topic, ty }) => {
+                    if let Err(e) = publisher_for(&mut publishers, &mut types, &mut node, &topic, &ty) {
+                        errors.lock().unwrap().push(format!("couldn't publish to {topic}: {e:#}"));
+                        wake();
+                    }
+                }
+                Ok(Command::Publish { topic, ty, bytes }) => {
+                    match publisher_for(&mut publishers, &mut types, &mut node, &topic, &ty) {
+                        Ok(_) => pending.push(Pending { key: (topic, ty), bytes, since: Instant::now() }),
+                        Err(e) => {
+                            errors.lock().unwrap().push(format!("couldn't publish to {topic}: {e:#}"));
+                            wake();
+                        }
+                    }
+                }
                 Ok(Command::Shutdown) | Err(TryRecvError::Disconnected) => {
                     for (_, subscription) in subscriptions.drain() {
                         node.unsubscribe(subscription.handle);
+                    }
+                    for (_, mut publisher) in publishers.drain() {
+                        // SAFETY: made by `advertise` and finished once
+                        unsafe { rcl_publisher_fini(&mut *publisher, &mut *node.node) };
                     }
                     wait_set.fini();
                     return;
@@ -66,6 +100,34 @@ pub fn run(
                 Err(TryRecvError::Empty) => break,
             }
         }
+
+        // Send what's waiting once its publisher has a subscriber, or it's waited long enough; in order per topic
+        let mut held = std::collections::HashSet::new();
+        pending.retain(|message| {
+            if held.contains(&message.key) {
+                return true;
+            }
+            let publisher = &publishers[&message.key];
+            let heard = subscription_count(publisher) > 0;
+            if !heard && message.since.elapsed() < MATCH_WAIT {
+                held.insert(message.key.clone());
+                return true;
+            }
+            let topic = &message.key.0;
+            if let Err(e) = Node::publish(publisher, &message.bytes) {
+                errors.lock().unwrap().push(format!("couldn't publish to {topic}: {e:#}"));
+                wake();
+            } else if heard {
+                unheard.remove(&message.key);
+            } else if unheard.insert(message.key.clone()) {
+                errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("sent to {topic}, but nothing subscribes to it, so nothing got it"));
+                wake();
+            }
+            false
+        });
 
         if last_graph.is_none_or(|at| at.elapsed() >= GRAPH_EVERY) {
             last_graph = Some(Instant::now());
@@ -95,6 +157,30 @@ pub fn run(
             }
         }
     }
+}
+
+/// The publisher for a topic and type, made the first time
+fn publisher_for<'a>(
+    publishers: &'a mut HashMap<(String, String), Box<rcl_publisher_t>>,
+    types: &mut TypeSupports,
+    node: &mut Node,
+    topic: &str,
+    ty: &str,
+) -> anyhow::Result<&'a mut Box<rcl_publisher_t>> {
+    match publishers.entry((topic.to_owned(), ty.to_owned())) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            types.get(ty).and_then(|ts| node.advertise(topic, ts)).map(|p| entry.insert(p))
+        }
+    }
+}
+
+/// How many subscriptions have matched a publisher
+fn subscription_count(publisher: &rcl_publisher_t) -> usize {
+    let mut count = 0;
+    // SAFETY: the publisher is initialized; rcl writes the count
+    let ret = unsafe { rcl_publisher_get_subscription_count(publisher, &mut count) };
+    if ret == RCL_RET_OK as i32 { count } else { 0 }
 }
 
 struct Subscription {
@@ -220,6 +306,38 @@ impl Node {
         }
     }
 
+    /// A publisher with the default QoS (reliable, volatile), which best-effort subscribers like micro-ROS's
+    /// kill switch also accept
+    fn advertise(
+        &mut self,
+        topic: &str,
+        type_support: *const rosidl_message_type_support_t,
+    ) -> anyhow::Result<Box<rcl_publisher_t>> {
+        let topic_c = CString::new(topic)?;
+        // SAFETY: the node is initialized; the publisher is boxed before rcl sees it
+        unsafe {
+            let mut publisher = Box::new(rcl_get_zero_initialized_publisher());
+            let options = rcl_publisher_get_default_options();
+            check(
+                rcl_publisher_init(&mut *publisher, &*self.node, type_support, topic_c.as_ptr(), &options),
+                "making a publisher",
+            )?;
+            Ok(publisher)
+        }
+    }
+
+    fn publish(publisher: &rcl_publisher_t, bytes: &[u8]) -> anyhow::Result<()> {
+        let message = rcl_serialized_message_t {
+            buffer: bytes.as_ptr().cast_mut(),
+            buffer_length: bytes.len(),
+            buffer_capacity: bytes.len(),
+            // SAFETY: only read; the RMW doesn't resize a message it's given to publish
+            allocator: unsafe { rcutils_get_default_allocator() },
+        };
+        // SAFETY: the publisher is initialized and the buffer outlives the call
+        check(unsafe { rcl_publish_serialized_message(publisher, &message, ptr::null_mut()) }, "publishing")
+    }
+
     fn unsubscribe(&mut self, mut handle: SubscriptionHandle) {
         // SAFETY: both were initialized by `subscribe` and are finished once
         unsafe {
@@ -249,7 +367,11 @@ impl Node {
                 if rcl_count_publishers(&*self.node, name_c.as_ptr(), &mut publishers) != RCL_RET_OK as i32 {
                     rcl_error();
                 }
-                topics.push(Topic { name, types, publishers });
+                let mut subscribers = 0;
+                if rcl_count_subscribers(&*self.node, name_c.as_ptr(), &mut subscribers) != RCL_RET_OK as i32 {
+                    rcl_error();
+                }
+                topics.push(Topic { name, types, publishers, subscribers });
             }
             rcl_names_and_types_fini(&mut found);
         }

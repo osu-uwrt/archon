@@ -17,6 +17,8 @@ pub enum Command {
     Start,
     Stop,
     Restart,
+    /// Take the source off the bench (and out of the profile, if asked)
+    Remove,
     StartAll,
     StopAll,
     FocusInput,
@@ -38,8 +40,64 @@ pub enum Command {
     NextError,
     PrevError,
 
+    /// Split the active pane, the new one to the right
     ToggleSplit,
+    SplitDown,
+    ClosePane,
     OtherPane,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+
+    OpenAllLogs,
+    OpenTopics,
+    /// A topic: switch between the inspector and the raw stream
+    ToggleStream,
+    /// Open what's selected: an inspector branch, a topic in the table
+    Activate,
+    ActivateBeside,
+    Expand,
+    Collapse,
+    MeasureAll,
+    ToggleWatch,
+
+    /// Open the publish form for the topic at hand, or pick one
+    /// Publish to the topic at hand: its echo, or the topics table's row
+    OpenPublish,
+    /// Pick any topic on the graph to publish to, without echoing it first
+    PublishAny,
+    /// In the publish form: send the message
+    Send,
+    /// In the publish form: keep sending at its rate
+    ToggleRepeat,
+    /// Run the profile's publish action with this 1-based number
+    RunAction(u8),
+
+    SaveLayout,
+    LoadLayout,
+
+    /// Plot the inspector's field at the cursor
+    Plot,
+    PlotWider,
+    PlotNarrower,
+
+    /// Record every topic to a bag, as a source of its own
+    RecordBag,
+
+    /// Run the micro-ROS agent on a port picked from a list
+    StartAgent,
+    /// Run a firmware build in firmware_simulator, with the agent and a console on it
+    Simulate,
+    OpenSerial,
+    OpenCan,
+    /// Write what's been opened into the profile, making one if there isn't one
+    SaveBench,
+    ShowWelcome,
+    /// Open another archon on a ROS network of its own, for a second board whose topics would mix with this one's
+    OpenIsolated,
+    /// Copy what a terminal needs to join this window's ROS network
+    CopyRosEnv,
 }
 
 pub struct CommandInfo {
@@ -80,6 +138,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     c(Start, "source.start", "Start source"),
     c(Stop, "source.stop", "Stop source"),
     c(Restart, "source.restart", "Restart source"),
+    c(Remove, "source.remove", "Remove source"),
     c(StartAll, "source.start_all", "Start all sources"),
     c(StopAll, "source.stop_all", "Stop all sources"),
     c(FocusInput, "source.input", "Send input to source"),
@@ -97,8 +156,50 @@ pub const COMMANDS: &[CommandInfo] = &[
     c(CopyOutput, "view.copy", "Copy output"),
     c(NextError, "view.next_error", "Next error or warning"),
     c(PrevError, "view.prev_error", "Previous error or warning"),
-    c(ToggleSplit, "pane.split", "Toggle split view"),
-    c(OtherPane, "pane.other", "Focus other pane"),
+    c(ToggleSplit, "pane.split", "Split right"),
+    c(SplitDown, "pane.split_down", "Split down"),
+    c(ClosePane, "pane.close", "Close pane"),
+    c(OtherPane, "pane.other", "Next pane"),
+    hidden(FocusLeft, "pane.left", "Pane to the left"),
+    hidden(FocusRight, "pane.right", "Pane to the right"),
+    hidden(FocusUp, "pane.up", "Pane above"),
+    hidden(FocusDown, "pane.down", "Pane below"),
+    c(OpenAllLogs, "open.logs", "Show all logs merged"),
+    c(OpenTopics, "open.topics", "Show topics table"),
+    c(ToggleStream, "view.mode", "Toggle topic inspector and stream"),
+    hidden(Activate, "view.activate", "Open selected"),
+    hidden(ActivateBeside, "view.activate_beside", "Open selected beside"),
+    hidden(Expand, "view.expand", "Expand"),
+    hidden(Collapse, "view.collapse", "Collapse"),
+    c(MeasureAll, "topics.measure", "Measure every topic's rate"),
+    c(ToggleWatch, "topics.watch", "Watch this topic's rate"),
+    c(OpenPublish, "topics.publish", "Publish to this topic"),
+    c(PublishAny, "topics.publish_any", "Publish to any topic"),
+    c(Send, "publish.send", "Send the message"),
+    c(ToggleRepeat, "publish.repeat", "Start or stop sending at the rate"),
+    c(SaveLayout, "layout.save", "Save layout as"),
+    c(LoadLayout, "layout.load", "Load a saved layout"),
+    c(Plot, "view.plot", "Plot the selected field"),
+    c(RecordBag, "bag.record", "Record a bag of every topic"),
+    c(StartAgent, "bench.agent", "Start the micro-ROS agent"),
+    c(Simulate, "bench.simulate", "Simulate a board in firmware_simulator"),
+    c(OpenSerial, "bench.serial", "Open a serial console"),
+    c(OpenCan, "bench.can", "Dump a CAN bus"),
+    c(SaveBench, "bench.save", "Save the bench to archon.toml"),
+    c(ShowWelcome, "help.start", "Getting started"),
+    c(OpenIsolated, "bench.isolated", "Open an isolated window (a ROS network of its own)"),
+    c(CopyRosEnv, "bench.copy_env", "Copy this window's ROS environment for a terminal"),
+    hidden(PlotWider, "plot.wider", "Plot a longer time"),
+    hidden(PlotNarrower, "plot.narrower", "Plot a shorter time"),
+    hidden(RunAction(1), "action.1", "Run action 1"),
+    hidden(RunAction(2), "action.2", "Run action 2"),
+    hidden(RunAction(3), "action.3", "Run action 3"),
+    hidden(RunAction(4), "action.4", "Run action 4"),
+    hidden(RunAction(5), "action.5", "Run action 5"),
+    hidden(RunAction(6), "action.6", "Run action 6"),
+    hidden(RunAction(7), "action.7", "Run action 7"),
+    hidden(RunAction(8), "action.8", "Run action 8"),
+    hidden(RunAction(9), "action.9", "Run action 9"),
 ];
 
 impl Command {

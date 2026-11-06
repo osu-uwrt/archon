@@ -50,14 +50,20 @@ fn wait_for<T>(what: &str, timeout: Duration, mut check: impl FnMut() -> Option<
     }
 }
 
+/// Keeps archon's own node off the network, for both tests, before either starts ROS
+fn localhost_only() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: runs once, before any test here starts ROS (and so before anything reads the environment)
+    ONCE.call_once(|| unsafe { std::env::set_var("ROS_LOCALHOST_ONLY", "1") });
+}
+
 #[test]
 fn echoes_a_live_topic() {
     if std::env::var_os("AMENT_PREFIX_PATH").is_none() {
         eprintln!("skipped: no ROS environment");
         return;
     }
-    // SAFETY: set before any thread of this test process reads the environment
-    unsafe { std::env::set_var("ROS_LOCALHOST_ONLY", "1") };
+    localhost_only();
     let topic = format!("/archon_live_{}", std::process::id());
     let _publisher = Publisher::start(&topic, "std_msgs/msg/String", "{data: hello archon}");
     let ros = Arc::new(Ros::start(Options { domain_id: Some(DOMAIN) }, Arc::new(|| {})).unwrap());
@@ -106,4 +112,81 @@ fn echoes_a_live_topic() {
     );
     let why = failed_rx.recv_timeout(Duration::from_secs(5)).expect("a failure");
     assert!(why.contains("libno_such_pkg__rosidl_typesupport_c.so"), "{why}");
+}
+
+/// archon publishes, and its own subscription gets the message back intact
+#[test]
+fn publishes_what_it_encodes() {
+    if std::env::var_os("AMENT_PREFIX_PATH").is_none() {
+        return;
+    }
+    localhost_only();
+    let ros = Ros::start(Options { domain_id: Some(DOMAIN + 1) }, Arc::new(|| {})).unwrap();
+    let mut registry = Registry::from_env();
+    let ty = archon_msg::TypeName::parse("std_msgs/msg/String").unwrap();
+    registry.load(&ty).unwrap();
+    let mut value = archon_msg::edit::default_value(&registry, &ty).unwrap();
+    archon_msg::edit::set_field(&registry, &ty, &mut value, "data", "from archon").unwrap();
+    let bytes = archon_msg::edit::encode(&registry, &ty, &value).unwrap();
+
+    let topic = format!("/archon_pub_{}", std::process::id());
+    let (tx, rx) = mpsc::channel();
+    ros.subscribe(
+        &topic,
+        "std_msgs/msg/String",
+        Box::new(move |d| {
+            if let Delivery::Message(m) = d {
+                let _ = tx.send(m.to_vec());
+            }
+        }),
+    );
+    let got = wait_for("our own message", Duration::from_secs(20), || {
+        ros.publish(&topic, "std_msgs/msg/String", bytes.clone());
+        rx.recv_timeout(Duration::from_millis(200)).ok()
+    });
+    assert_eq!(archon_msg::cdr::decode(&registry, &ty, &got).unwrap(), value);
+    assert!(ros.take_errors().is_empty());
+
+    ros.publish("/x", "no_such_pkg/msg/Thing", Vec::new());
+    let errors =
+        wait_for("a publishing error", Duration::from_secs(5), || Some(ros.take_errors()).filter(|e| !e.is_empty()));
+    assert!(errors[0].contains("couldn't publish to /x"), "{errors:?}");
+}
+
+/// One send on a topic archon hasn't published to yet reaches a subscriber that's already there, as a single Send in
+/// the publish form must: the message waits for the subscriber to match rather than going out to nobody
+#[test]
+fn a_single_send_reaches_a_waiting_subscriber() {
+    if std::env::var_os("AMENT_PREFIX_PATH").is_none() {
+        return;
+    }
+    localhost_only();
+    let domain = Some(DOMAIN + 2);
+    let listener = Ros::start(Options { domain_id: domain }, Arc::new(|| {})).unwrap();
+    let topic = format!("/archon_once_{}", std::process::id());
+    let (tx, rx) = mpsc::channel();
+    listener.subscribe(
+        &topic,
+        "std_msgs/msg/Int8",
+        Box::new(move |d| {
+            if let Delivery::Message(m) = d {
+                let _ = tx.send(m.to_vec());
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sender = Ros::start(Options { domain_id: domain }, Arc::new(|| {})).unwrap();
+    // CDR: the encapsulation header, then the byte
+    sender.publish(&topic, "std_msgs/msg/Int8", vec![0, 1, 0, 0, 90]);
+    let got = rx.recv_timeout(Duration::from_secs(5)).expect("the one message sent");
+    assert_eq!(got.last(), Some(&90));
+    assert!(sender.take_errors().is_empty());
+
+    // With nobody subscribed, it says so instead of the message vanishing
+    sender.publish(&format!("{topic}_nobody"), "std_msgs/msg/Int8", vec![0, 1, 0, 0, 1]);
+    let errors = wait_for("word that nobody heard", Duration::from_secs(5), || {
+        Some(sender.take_errors()).filter(|e| !e.is_empty())
+    });
+    assert!(errors[0].contains("nothing subscribes"), "{errors:?}");
 }

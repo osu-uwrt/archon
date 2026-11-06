@@ -1,0 +1,44 @@
+# A titan board on USB running micro-ROS (examples/micro_ros_template built for `pico` with `micro_ros_usb`): the agent
+# on the board's micro-ROS port, its console on the other, its status inspected and its rates watched.
+# Change the by-id paths to your board's: ls /dev/serial/by-id/
+#   nix develop -c cargo run --release -- examples/titan-usb-board.toml
+
+[[process]]
+name = "agent"
+cmd = "cd ~/dev/uwrt/micro-ros-agent && source install/setup.bash && exec install/lib/micro_ros_agent/micro_ros_agent serial --dev /dev/serial/by-id/usb-OSU_UWRT_Micro-ROS_Agent_E6613852838B7C32-if02"
+autostart = true
+restart = "on-failure"
+
+[[serial]]
+name = "board"
+port = "/dev/serial/by-id/usb-OSU_UWRT_Micro-ROS_Agent_E6613852838B7C32-if00"
+
+[[echo]]
+topic = "/talos/state/firmware"
+name = "firmware"
+
+[[watch]]
+topic = "/talos/heartbeat"
+min_hz = 9
+
+[[watch]]
+topic = "/talos/state/firmware"
+min_hz = 0.8
+
+# The firmware's kill switch wants an update at least every second or it times out, so these send at 10 Hz:
+# F2 starts asserting the kill (and F2 again stops); F3 sends "not killed" the same way
+[[publish]]
+name = "kill"
+topic = "/talos/state/kill"
+type = "std_msgs/msg/Bool"
+value = { data = true }
+rate = 10
+key = "F2"
+
+[[publish]]
+name = "unkill"
+topic = "/talos/state/kill"
+type = "std_msgs/msg/Bool"
+value = { data = false }
+rate = 10
+key = "F3"

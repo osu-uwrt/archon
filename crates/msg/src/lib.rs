@@ -3,6 +3,7 @@
 //! type in the firmware needs no rebuild of archon.
 
 pub mod cdr;
+pub mod edit;
 pub mod registry;
 pub mod schema;
 pub mod value;

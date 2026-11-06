@@ -1,5 +1,6 @@
 //! Owns every source in a profile, keeps their output, and restarts them according to their restart policy.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -10,6 +11,7 @@ use archon_core::line::{Level, LineBuffer};
 use archon_core::profile::{Profile, RestartPolicy};
 use archon_core::source::{Envelope, Event, Sink, Source, SourceId, SourceKind, Status};
 
+use crate::can::CanSource;
 use crate::process::ProcessSource;
 use crate::serial::SerialSource;
 
@@ -22,6 +24,8 @@ const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 
 pub struct Entry {
     pub name: String,
+    /// Taken off the bench: stopped and hidden, its slot kept so other sources' numbers don't shift
+    pub removed: bool,
     pub kind: SourceKind,
     pub description: String,
     pub status: Status,
@@ -48,6 +52,10 @@ impl Entry {
     pub fn detail(&self) -> Option<String> {
         self.source.detail()
     }
+
+    pub fn in_merged_logs(&self) -> bool {
+        self.source.in_merged_logs()
+    }
 }
 
 pub struct Supervisor {
@@ -55,13 +63,50 @@ pub struct Supervisor {
     tx: Sender<Envelope>,
     rx: Receiver<Envelope>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    timeline: Timeline,
+}
+
+/// Every line of every source in the order they arrived, which is time order, for the merged log
+#[derive(Default)]
+pub struct Timeline {
+    /// Each line as its source and its absolute number in that source's buffer
+    rows: VecDeque<(SourceId, u64)>,
+    evicted: u64,
+    /// Goes up whenever a source's output is cleared, since its rows here then point at nothing
+    pub clears: u64,
+}
+
+/// Lines kept in the merged timeline, across all sources
+const TIMELINE_ROWS: usize = 1_000_000;
+
+impl Timeline {
+    fn push(&mut self, id: SourceId, row: u64) {
+        if self.rows.len() == TIMELINE_ROWS {
+            self.rows.pop_front();
+            self.evicted += 1;
+        }
+        self.rows.push_back((id, row));
+    }
+
+    /// The absolute number of the first row kept
+    pub fn first(&self) -> u64 {
+        self.evicted
+    }
+
+    pub fn end(&self) -> u64 {
+        self.evicted + self.rows.len() as u64
+    }
+
+    pub fn get(&self, row: u64) -> Option<(SourceId, u64)> {
+        row.checked_sub(self.evicted).and_then(|i| self.rows.get(i as usize)).copied()
+    }
 }
 
 impl Supervisor {
     /// `wake` is called from the sources' threads whenever they have news, to get the UI to poll
     pub fn new(profile: &Profile, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (tx, rx) = mpsc::channel();
-        let mut supervisor = Self { entries: Vec::new(), tx, rx, wake };
+        let mut supervisor = Self { entries: Vec::new(), tx, rx, wake, timeline: Timeline::default() };
         for spec in &profile.processes {
             let source = ProcessSource::new(spec.clone(), &profile.env);
             supervisor.add(&spec.name, Box::new(source), spec.restart, spec.autostart, "\n");
@@ -74,6 +119,15 @@ impl Supervisor {
                 RestartPolicy::Never,
                 spec.autostart,
                 ending,
+            );
+        }
+        for spec in &profile.cans {
+            supervisor.add(
+                &spec.name,
+                Box::new(CanSource::new(spec.clone())),
+                RestartPolicy::Never,
+                spec.autostart,
+                "",
             );
         }
         supervisor
@@ -90,6 +144,7 @@ impl Supervisor {
     ) -> SourceId {
         self.entries.push(Entry {
             name: name.to_owned(),
+            removed: false,
             kind: source.kind(),
             description: source.describe(),
             status: Status::Stopped,
@@ -116,6 +171,31 @@ impl Supervisor {
         &mut self.entries[id]
     }
 
+    pub fn timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
+    /// Takes a source off the bench: stops it, drops its output, and hides it
+    pub fn remove(&mut self, id: SourceId) {
+        self.stop(id);
+        let entry = &mut self.entries[id];
+        entry.removed = true;
+        entry.autostart = false;
+        entry.buffer.clear();
+        self.timeline.clears += 1;
+    }
+
+    /// The sources still on the bench, with their numbers
+    pub fn live(&self) -> impl Iterator<Item = (SourceId, &Entry)> {
+        self.entries.iter().enumerate().filter(|(_, e)| !e.removed)
+    }
+
+    /// Clears a source's output
+    pub fn clear(&mut self, id: SourceId) {
+        self.entries[id].buffer.clear();
+        self.timeline.clears += 1;
+    }
+
     pub fn start_autostart(&mut self) {
         for id in 0..self.entries.len() {
             if self.entries[id].autostart {
@@ -126,6 +206,9 @@ impl Supervisor {
 
     pub fn start(&mut self, id: SourceId) {
         let entry = &mut self.entries[id];
+        if entry.removed {
+            return;
+        }
         entry.wanted = true;
         entry.quick_exits = 0;
         if !entry.status.is_active() {
@@ -146,6 +229,9 @@ impl Supervisor {
 
     pub fn restart(&mut self, id: SourceId) {
         let entry = &mut self.entries[id];
+        if entry.removed {
+            return;
+        }
         entry.wanted = true;
         entry.quick_exits = 0;
         if entry.status.is_active() {
@@ -191,8 +277,15 @@ impl Supervisor {
             }
             changed = true;
             match event {
-                Event::Output(text) => entry.buffer.push_output(&text),
-                Event::Note(text, level) => entry.buffer.push_note(text, level),
+                Event::Output(text) => {
+                    let before = entry.buffer.total();
+                    entry.buffer.push_output(&text);
+                    (before..entry.buffer.total()).for_each(|row| self.timeline.push(id, row));
+                }
+                Event::Note(text, level) => {
+                    entry.buffer.push_note(text, level);
+                    self.timeline.push(id, entry.buffer.total() - 1);
+                }
                 Event::Status(status) => {
                     let ended = !status.is_active();
                     entry.status = status;
@@ -329,6 +422,38 @@ mod tests {
         thread::sleep(Duration::from_millis(1200));
         sup.poll();
         assert_eq!(sup.entries()[0].status, Status::Exited(Some(1)), "it stayed stopped");
+    }
+
+    #[test]
+    fn timeline_interleaves_sources_in_arrival_order() {
+        let mut sup = supervisor(
+            "[[process]]\nname = \"a\"\ncmd = \"echo a1; sleep 0.3; echo a2\"\n[[process]]\nname = \"b\"\ncmd = \"sleep 0.15; echo b1\"\n",
+        );
+        sup.start_all();
+        poll_until(&mut sup, |s| s.entries().iter().all(|e| matches!(e.status, Status::Exited(_))));
+        let text =
+            |s: &Supervisor, (id, row): (SourceId, u64)| s.entries()[id].buffer.get_abs(row).unwrap().text.clone();
+        let timeline = sup.timeline();
+        let order: Vec<String> = (timeline.first()..timeline.end())
+            .map(|row| text(&sup, timeline.get(row).unwrap()))
+            .filter(|t| t.len() == 2)
+            .collect();
+        assert_eq!(order, ["a1", "b1", "a2"]);
+    }
+
+    #[test]
+    fn removing_stops_and_hides() {
+        let mut sup = supervisor(
+            "[[process]]\nname = \"a\"\ncmd = \"sleep 30\"\n[[process]]\nname = \"b\"\ncmd = \"sleep 30\"\n",
+        );
+        sup.start_all();
+        poll_until(&mut sup, |s| s.entries().iter().all(|e| e.status == Status::Running));
+        sup.remove(0);
+        poll_until(&mut sup, |s| !s.entries()[0].status.is_active());
+        assert_eq!(sup.live().map(|(id, _)| id).collect::<Vec<_>>(), [1], "b keeps its number");
+        sup.start(0);
+        assert!(!sup.entries()[0].status.is_active(), "a removed source doesn't start again");
+        sup.shutdown(Duration::from_secs(5));
     }
 
     #[test]

@@ -1,22 +1,20 @@
 //! `ros2 topic echo` as a source: each message decoded to text, a `---` between messages, and the message rate for
 //! the sidebar. Log messages (`/rosout`) come out as log lines instead, so every node's logs read like one terminal.
 
-use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use archon_core::line::Level;
 use archon_core::source::{Sink, Source, SourceKind, Status};
 use archon_msg::{Registry, TypeName, Value, cdr};
 
+use crate::topic::TopicState;
 use crate::{Delivery, Ros, SubscriptionId};
 
 /// How often to look for a topic that isn't on the graph yet
 const LOOK_EVERY: Duration = Duration::from_millis(500);
-/// The rate is over the messages of the last this long
-const RATE_WINDOW: Duration = Duration::from_secs(2);
 
 const LOG_TYPE: &str = "rcl_interfaces/msg/Log";
 
@@ -26,7 +24,7 @@ pub struct EchoSource {
     topic: String,
     /// Known up front, or found on the graph once the topic appears
     ty: Option<String>,
-    rate: Arc<Mutex<Rate>>,
+    state: Arc<Mutex<TopicState>>,
     run: Option<Run>,
 }
 
@@ -38,7 +36,12 @@ struct Run {
 
 impl EchoSource {
     pub fn new(ros: Arc<Ros>, registry: Arc<Mutex<Registry>>, topic: &str, ty: Option<&str>) -> Self {
-        Self { ros, registry, topic: topic.to_owned(), ty: ty.map(str::to_owned), rate: Arc::default(), run: None }
+        Self { ros, registry, topic: topic.to_owned(), ty: ty.map(str::to_owned), state: Arc::default(), run: None }
+    }
+
+    /// The latest message and its history, for the inspector
+    pub fn state(&self) -> Arc<Mutex<TopicState>> {
+        self.state.clone()
     }
 }
 
@@ -48,15 +51,15 @@ impl Source for EchoSource {
     }
 
     fn describe(&self) -> String {
-        self.ty.clone().unwrap_or_else(|| "type not known yet".to_owned())
+        self.topic.clone()
     }
 
     fn start(&mut self, sink: Sink) {
         let run = Run { stop: Arc::default(), subscription: Arc::default(), sink: sink.clone() };
         let (stop, subscription) = (run.stop.clone(), run.subscription.clone());
-        let (ros, registry, rate) = (self.ros.clone(), self.registry.clone(), self.rate.clone());
+        let (ros, registry, state) = (self.ros.clone(), self.registry.clone(), self.state.clone());
         let (topic, ty) = (self.topic.clone(), self.ty.clone());
-        *self.rate.lock().unwrap() = Rate::default();
+        *self.state.lock().unwrap() = TopicState::new(&topic, ty.as_deref());
         self.run = Some(run);
         // Off the UI thread, since the topic may not exist yet
         std::thread::spawn(move || {
@@ -77,17 +80,25 @@ impl Source for EchoSource {
 
             let deliver = sink.clone();
             let type_name = ty.clone();
+            let (state_for_type, ty_for_state) = (state.clone(), ty.clone());
             let id = ros.subscribe(
                 &topic,
                 &type_name,
                 Box::new(move |delivery| match delivery {
                     Delivery::Message(bytes) => {
-                        rate.lock().unwrap().tick();
                         let decoded = cdr::decode(&registry.lock().unwrap(), &name, bytes);
-                        deliver.output(match decoded {
-                            Ok(value) => format_message(&ty, &value),
+                        let mut state = state.lock().unwrap();
+                        state.record(bytes, decoded.as_ref().err().map(|e| format!("{e:#}")));
+                        let text = match decoded {
+                            Ok(value) => {
+                                let text = format_message(&ty, &value);
+                                state.update(value);
+                                text
+                            }
                             Err(e) => format!("[archon] couldn't decode a {ty} message: {e:#}\n"),
-                        });
+                        };
+                        drop(state);
+                        deliver.output(text);
                     }
                     Delivery::Failed(e) => {
                         deliver.note(e.clone(), Level::Error);
@@ -102,6 +113,7 @@ impl Source for EchoSource {
                 return;
             }
             *held = Some(id);
+            state_for_type.lock().unwrap().ty = Some(ty_for_state);
             sink.note(format!("subscribed to {topic}"), Level::Info);
             sink.status(Status::Running);
         });
@@ -123,7 +135,7 @@ impl Source for EchoSource {
     }
 
     fn detail(&self) -> Option<String> {
-        let rate = self.rate.lock().unwrap().hz();
+        let rate = self.state.lock().unwrap().rate.hz();
         let publishers = self.ros.graph().topic(&self.topic).map_or(0, |t| t.publishers);
         let rate = match rate {
             Some(hz) if hz >= 10.0 => format!("{hz:.0} Hz"),
@@ -132,6 +144,10 @@ impl Source for EchoSource {
         };
         let s = if publishers == 1 { "" } else { "s" };
         Some(format!("{rate} · {publishers} publisher{s}"))
+    }
+
+    fn in_merged_logs(&self) -> bool {
+        self.topic == "/rosout" || self.ty.as_deref() == Some(LOG_TYPE)
     }
 }
 
@@ -182,29 +198,6 @@ fn log_line(value: &Value) -> Option<String> {
     Some(format!("[{level}] [{sec}.{:09}] [{}]: {}\n", nanosec as u64, text("name")?, text("msg")?))
 }
 
-#[derive(Default)]
-struct Rate {
-    times: VecDeque<Instant>,
-}
-
-impl Rate {
-    fn tick(&mut self) {
-        let now = Instant::now();
-        self.times.push_back(now);
-        while self.times.front().is_some_and(|&t| now - t > RATE_WINDOW) {
-            self.times.pop_front();
-        }
-    }
-
-    fn hz(&self) -> Option<f64> {
-        let (first, last) = (*self.times.front()?, *self.times.back()?);
-        if self.times.len() < 2 || last.elapsed() > RATE_WINDOW {
-            return None;
-        }
-        Some((self.times.len() - 1) as f64 / (last - first).as_secs_f64())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,15 +213,5 @@ mod tests {
         ]);
         assert_eq!(format_message(LOG_TYPE, &log), "[WARN] [12.005000000] [thrusters]: no heartbeat\n");
         assert!(format_message("std_msgs/msg/Empty", &Value::Struct(Vec::new())).ends_with("---\n"));
-    }
-
-    #[test]
-    fn measures_rate() {
-        let mut rate = Rate::default();
-        assert_eq!(rate.hz(), None);
-        let start = Instant::now();
-        rate.times = (0..11).map(|i| start - Duration::from_millis(100 * (10 - i))).collect();
-        let hz = rate.hz().unwrap();
-        assert!((hz - 10.0).abs() < 0.01, "{hz}");
     }
 }

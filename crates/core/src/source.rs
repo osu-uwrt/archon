@@ -13,6 +13,8 @@ pub enum SourceKind {
     Serial,
     /// A ROS topic echo
     Topic,
+    /// A SocketCAN bus
+    Can,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -101,5 +103,11 @@ pub trait Source: Send {
     /// A live detail for the sidebar while it runs, like a topic's message rate
     fn detail(&self) -> Option<String> {
         None
+    }
+
+    /// Whether its lines belong in the merged log of every source. A topic echo of anything but logs doesn't: at
+    /// hundreds of messages a second it would drown everything else.
+    fn in_merged_logs(&self) -> bool {
+        true
     }
 }

@@ -19,3 +19,28 @@ port = "/dev/serial/by-id/usb-..."
 baud = 115200
 # autostart = true          # the default for serial ports
 # line_ending = "lf"        # lf (default) | crlf | cr | none, appended to what you send
+
+# Topic echoes, opened with the profile; they wait for the topic to appear
+[[echo]]
+topic = "/rosout"
+name = "logs"
+
+# Rates for the health strip
+[[watch]]
+topic = "/imu/data"
+min_hz = 100
+
+# A message to publish, sent from the sidebar, the palette, or its key. With a rate, the key starts and stops
+# sending at that rate instead of sending once.
+[[publish]]
+name = "kill"
+topic = "/talos/state/kill"
+type = "std_msgs/msg/Bool"
+value = { data = true }
+rate = 10
+key = "F2"
+
+# A CAN bus, shown like candump; type id#data into it (i) to send a frame
+# [[can]]
+# name = "bus"
+# interface = "can0"

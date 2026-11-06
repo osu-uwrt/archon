@@ -151,6 +151,11 @@ impl LineBuffer {
         self.lines.is_empty()
     }
 
+    /// A line by its absolute number (see [`LineBuffer::evicted`]), if still kept
+    pub fn get_abs(&self, row: u64) -> Option<&Line> {
+        row.checked_sub(self.evicted).and_then(|index| self.lines.get(index as usize))
+    }
+
     pub fn get(&self, index: usize) -> Option<&Line> {
         self.lines.get(index)
     }

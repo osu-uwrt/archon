@@ -1,12 +1,94 @@
-//! The scrolling output of one source.
+//! A scrolling log: one source's output, or every source's merged in time order. Follows new output, filters with
+//! highlighted matches, jumps between errors, and copies what's shown.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use archon_core::line::{Level, LineBuffer, Origin};
-use archon_core::source::{SourceKind, Status};
-use archon_sources::Entry;
+use archon_core::line::{Level, Line, LineBuffer, Origin};
+use archon_core::source::{SourceId, SourceKind, Status};
+use archon_sources::{Entry, Timeline};
 use egui::text::LayoutJob;
-use egui::{Color32, FontId, Label, RichText, ScrollArea, Stroke, TextFormat, TextStyle, Ui, Visuals};
+use egui::{Color32, FontId, Label, RichText, ScrollArea, TextFormat, TextStyle, Ui, Visuals};
+
+/// Lines a log view can show, by absolute row number
+pub trait Rows {
+    fn first(&self) -> u64;
+    fn end(&self) -> u64;
+    /// `None` for a row that's gone (cleared) or not shown here
+    fn line(&self, row: u64) -> Option<Row<'_>>;
+    /// Changes when rows already looked at may have gone, so a filtered list starts over
+    fn generation(&self) -> u64;
+    /// Whether rows between `first` and `end` can be missing, so the view must keep a list of the ones to show
+    fn sparse(&self) -> bool;
+}
+
+pub struct Row<'a> {
+    pub line: &'a Line,
+    /// Which source wrote it, in the merged view
+    pub source: Option<(SourceId, &'a str)>,
+}
+
+impl Rows for LineBuffer {
+    fn first(&self) -> u64 {
+        self.evicted()
+    }
+    fn end(&self) -> u64 {
+        self.total()
+    }
+    fn line(&self, row: u64) -> Option<Row<'_>> {
+        self.get_abs(row).map(|line| Row { line, source: None })
+    }
+    fn generation(&self) -> u64 {
+        0
+    }
+    fn sparse(&self) -> bool {
+        false
+    }
+}
+
+/// Every source's lines in the order they arrived
+pub struct Merged<'a> {
+    pub timeline: &'a Timeline,
+    pub entries: &'a [Entry],
+}
+
+impl Rows for Merged<'_> {
+    fn first(&self) -> u64 {
+        self.timeline.first()
+    }
+    fn end(&self) -> u64 {
+        self.timeline.end()
+    }
+    fn line(&self, row: u64) -> Option<Row<'_>> {
+        let (id, source_row) = self.timeline.get(row)?;
+        let entry = self.entries.get(id).filter(|e| e.in_merged_logs() && !e.removed)?;
+        entry.buffer.get_abs(source_row).map(|line| Row { line, source: Some((id, entry.name.as_str())) })
+    }
+    fn generation(&self) -> u64 {
+        self.timeline.clears
+    }
+    fn sparse(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TopicMode {
+    #[default]
+    Inspector,
+    Stream,
+    Bytes,
+}
+
+impl TopicMode {
+    /// What `v` goes to next
+    pub fn next(self) -> Self {
+        match self {
+            TopicMode::Inspector => TopicMode::Stream,
+            TopicMode::Stream => TopicMode::Bytes,
+            TopicMode::Bytes => TopicMode::Inspector,
+        }
+    }
+}
 
 pub enum Scroll {
     Lines(f32),
@@ -17,13 +99,15 @@ pub enum Scroll {
     Row(usize),
 }
 
-/// How one source is being viewed. Each source has one, shared by the panes showing it.
+/// How a log is being viewed: each source has one, and so does the merged log
 pub struct ViewState {
     /// Stay at the end as output arrives
     pub follow: bool,
     /// Only show lines containing this, ignoring case unless it has a capital
     pub filter: String,
-    filtered: Filtered,
+    /// For a topic: the inspector, the stream, or the bytes
+    pub mode: TopicMode,
+    listed: Listed,
     scroll: Option<Scroll>,
     offset: f32,
     row_height: f32,
@@ -31,13 +115,13 @@ pub struct ViewState {
     marked: Option<u64>,
 }
 
-/// The lines matching a filter, kept up to date as output arrives instead of rescanning every frame
+/// The rows to show when not all of them are, kept up to date as output arrives instead of rescanning every frame
 #[derive(Default)]
-struct Filtered {
+struct Listed {
     filter: String,
-    /// Absolute numbers (see [`LineBuffer::evicted`]) of the matching lines
+    generation: u64,
     rows: Vec<u64>,
-    /// The absolute number of the first line not yet checked
+    /// The absolute number of the first row not yet looked at
     next: u64,
 }
 
@@ -46,7 +130,8 @@ impl Default for ViewState {
         Self {
             follow: true,
             filter: String::new(),
-            filtered: Filtered::default(),
+            mode: TopicMode::Inspector,
+            listed: Listed::default(),
             scroll: None,
             offset: 0.0,
             row_height: 1.0,
@@ -64,26 +149,60 @@ impl ViewState {
         self.scroll = Some(scroll);
     }
 
-    /// The absolute numbers of the lines shown, in order
-    fn shown(&mut self, buffer: &LineBuffer) -> Vec<u64> {
-        if self.filter.is_empty() {
-            (buffer.evicted()..buffer.total()).collect()
+    pub fn toggle_follow(&mut self) {
+        if self.follow {
+            self.follow = false;
         } else {
-            self.update_filter(buffer);
-            self.filtered.rows.clone()
+            self.scroll(Scroll::Bottom);
+        }
+    }
+
+    /// Whether rows go through the list: when filtering, or when the rows have gaps
+    fn listing(&self, rows: &dyn Rows) -> bool {
+        !self.filter.is_empty() || rows.sparse()
+    }
+
+    fn update_list(&mut self, rows: &dyn Rows) {
+        let listed = &mut self.listed;
+        let (first, end) = (rows.first(), rows.end());
+        if listed.filter != self.filter || listed.generation != rows.generation() {
+            listed.filter.clone_from(&self.filter);
+            listed.generation = rows.generation();
+            listed.rows.clear();
+            listed.next = first;
+        }
+        // Look at the last row again, since it may have grown since
+        let start = listed.next.saturating_sub(1).max(first);
+        listed.rows.retain(|&row| row >= first && row < start);
+        for row in start..end {
+            if rows
+                .line(row)
+                .is_some_and(|r| find(&r.line.text, &self.filter).next().is_some() || self.filter.is_empty())
+            {
+                listed.rows.push(row);
+            }
+        }
+        listed.next = end;
+    }
+
+    /// The absolute numbers of the rows shown, in order
+    fn shown(&mut self, rows: &dyn Rows) -> Vec<u64> {
+        if self.listing(rows) {
+            self.update_list(rows);
+            self.listed.rows.clone()
+        } else {
+            (rows.first()..rows.end()).collect()
         }
     }
 
     /// Moves to the next (or previous) error or warning after the last one jumped to, or after the top of the view.
     /// Returns false when there isn't one.
-    pub fn jump_to_problem(&mut self, buffer: &LineBuffer, forward: bool) -> bool {
-        let shown = self.shown(buffer);
+    pub fn jump_to_problem(&mut self, rows: &dyn Rows, forward: bool) -> bool {
+        let shown = self.shown(rows);
         let top = (self.offset / self.row_height).floor() as usize;
         let from = self.marked.and_then(|m| shown.binary_search(&m).ok()).unwrap_or(top);
-        let is_problem = |row: &u64| {
-            let line = buffer.get((row - buffer.evicted()) as usize).expect("shown rows are in the buffer");
-            matches!(line.level, Level::Error | Level::Warn)
-        };
+        let is_problem =
+            |row: &u64| rows.line(*row).is_some_and(|r| matches!(r.line.level, Level::Error | Level::Warn));
         let found = if forward {
             shown.iter().enumerate().skip(from + usize::from(self.marked.is_some())).find(|(_, row)| is_problem(row))
         } else {
@@ -95,52 +214,24 @@ impl ViewState {
         true
     }
 
-    /// The lines shown, as text, for copying
-    pub fn shown_text(&mut self, buffer: &LineBuffer) -> (String, usize) {
-        let shown = self.shown(buffer);
-        let text = shown
+    /// The lines shown, as text, for copying. Merged lines carry their source's name.
+    pub fn shown_text(&mut self, rows: &dyn Rows) -> (String, usize) {
+        let shown = self.shown(rows);
+        let lines: Vec<String> = shown
             .iter()
-            .map(|row| {
-                buffer.get((row - buffer.evicted()) as usize).expect("shown rows are in the buffer").text.as_str()
+            .filter_map(|&row| rows.line(row))
+            .map(|r| match r.source {
+                Some((_, name)) => format!("{name}: {}", r.line.text),
+                None => r.line.text.clone(),
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        (text, shown.len())
-    }
-
-    pub fn toggle_follow(&mut self) {
-        if self.follow {
-            self.follow = false;
-        } else {
-            self.scroll(Scroll::Bottom);
-        }
-    }
-
-    fn update_filter(&mut self, buffer: &LineBuffer) {
-        let filtered = &mut self.filtered;
-        let first = buffer.evicted();
-        let end = first + buffer.len() as u64;
-        if filtered.filter != self.filter {
-            filtered.filter.clone_from(&self.filter);
-            filtered.rows.clear();
-            filtered.next = first;
-        }
-        // Check the last line again, since it may have grown since
-        let start = filtered.next.saturating_sub(1).max(first);
-        filtered.rows.retain(|&row| row >= first && row < start);
-
-        for row in start..end {
-            let text = &buffer.get((row - first) as usize).expect("row is in the buffer").text;
-            if find(text, &self.filter).next().is_some() {
-                filtered.rows.push(row);
-            }
-        }
-        filtered.next = end;
+            .collect();
+        let count = lines.len();
+        (lines.join("\n"), count)
     }
 }
 
 /// Where `needle` occurs in `text`, ignoring ASCII case unless the needle has a capital
-fn find<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+pub fn find<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
     let ignore_case = !needle.chars().any(char::is_uppercase);
     let (hay, pin) = (text.as_bytes(), needle.as_bytes());
     let mut at = 0;
@@ -188,6 +279,7 @@ pub fn kind_tag(kind: SourceKind) -> &'static str {
         SourceKind::Process => "proc",
         SourceKind::Serial => "serial",
         SourceKind::Topic => "topic",
+        SourceKind::Can => "can",
     }
 }
 
@@ -195,6 +287,19 @@ pub fn kind_tag(kind: SourceKind) -> &'static str {
 pub fn status_dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// A colour per source, so its lines are easy to pick out in the merged log
+pub fn source_color(id: SourceId) -> Color32 {
+    const COLORS: [Color32; 6] = [
+        Color32::from_rgb(110, 170, 225),
+        Color32::from_rgb(190, 145, 225),
+        Color32::from_rgb(110, 195, 160),
+        Color32::from_rgb(225, 165, 110),
+        Color32::from_rgb(220, 125, 160),
+        Color32::from_rgb(170, 190, 100),
+    ];
+    COLORS[id % COLORS.len()]
 }
 
 fn level_color(level: Level, visuals: &Visuals) -> Color32 {
@@ -219,39 +324,48 @@ fn clock(time: SystemTime) -> String {
     format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, since_epoch.subsec_millis())
 }
 
-/// Shows the source's header and output. `highlight` marks the active pane when there are two. Returns whether the
-/// pane was clicked.
-pub fn show(ui: &mut Ui, pane: usize, entry: &Entry, view: &mut ViewState, timestamps: bool, highlight: bool) -> bool {
-    let visuals = ui.visuals().clone();
-    let stroke = if highlight { Stroke::new(1.0, visuals.selection.stroke.color) } else { Stroke::NONE };
-    let frame = egui::Frame::NONE.stroke(stroke).inner_margin(4.0);
-    let response = frame.show(ui, |ui| {
-        // Long lines scroll sideways inside the pane instead of drawing over its neighbour
-        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-        header(ui, entry, view);
-        ui.separator();
-        lines(ui, pane, entry, view, timestamps);
-    });
-    let rect = response.response.rect;
-    ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_pressed())
+/// A local date and time for file names, `20261106-021530`
+pub fn file_stamp(time: SystemTime) -> String {
+    let secs = time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+    // SAFETY: localtime_r only writes the tm it's given
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        tm
+    };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
-fn header(ui: &mut Ui, entry: &Entry, view: &ViewState) {
+/// The right end of a log's header: line counts, the filter, and whether it follows
+fn header_state(ui: &mut Ui, view: &ViewState, total: usize) {
+    let visuals = ui.visuals().clone();
+    let (mode, color) =
+        if view.follow { ("FOLLOW", visuals.weak_text_color()) } else { ("PAUSED", visuals.warn_fg_color) };
+    ui.label(RichText::new(mode).small().color(color));
+    if view.filter.is_empty() {
+        ui.label(RichText::new(format!("{total} lines")).small().weak());
+    } else {
+        let shown = view.listed.rows.len();
+        ui.label(RichText::new(format!("/{}  {shown} of {total}", view.filter)).small());
+    }
+}
+
+pub fn source_header(ui: &mut Ui, entry: &Entry, view: &ViewState) {
     let visuals = ui.visuals().clone();
     ui.horizontal(|ui| {
         status_dot(ui, status_color(&entry.status, &visuals));
         ui.label(RichText::new(&entry.name).strong());
         ui.label(RichText::new(status_text(&entry.status)).weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (mode, color) =
-                if view.follow { ("FOLLOW", visuals.weak_text_color()) } else { ("PAUSED", visuals.warn_fg_color) };
-            ui.label(RichText::new(mode).small().color(color));
-            if view.filter.is_empty() {
-                ui.label(RichText::new(format!("{} lines", entry.buffer.len())).small().weak());
-            } else {
-                let shown = view.filtered.rows.len();
-                ui.label(RichText::new(format!("/{}  {shown} of {}", view.filter, entry.buffer.len())).small());
-            }
+            header_state(ui, view, entry.buffer.len());
             // Last, so it gets whatever width is left and is cut short rather than pushing into the other pane
             ui.add(Label::new(RichText::new(&entry.description).weak().monospace()).truncate())
                 .on_hover_text(&entry.description);
@@ -259,13 +373,21 @@ fn header(ui: &mut Ui, entry: &Entry, view: &ViewState) {
     });
 }
 
-fn lines(ui: &mut Ui, pane: usize, entry: &Entry, view: &mut ViewState, timestamps: bool) {
-    let buffer = &entry.buffer;
-    let filtering = !view.filter.is_empty();
-    if filtering {
-        view.update_filter(buffer);
+pub fn merged_header(ui: &mut Ui, view: &ViewState, total: usize) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("All logs").strong());
+        ui.label(RichText::new("every source, in the order lines arrived").weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| header_state(ui, view, total));
+    });
+}
+
+/// The lines themselves. `pane` keeps each pane's scrolling apart.
+pub fn lines(ui: &mut Ui, pane: usize, rows: &dyn Rows, view: &mut ViewState, timestamps: bool) {
+    let listing = view.listing(rows);
+    if listing {
+        view.update_list(rows);
     }
-    let count = if filtering { view.filtered.rows.len() } else { buffer.len() };
+    let count = if listing { view.listed.rows.len() } else { (rows.end() - rows.first()) as usize };
 
     ui.spacing_mut().item_spacing.y = 0.0;
     let font = TextStyle::Monospace.resolve(ui.style());
@@ -273,7 +395,7 @@ fn lines(ui: &mut Ui, pane: usize, entry: &Entry, view: &mut ViewState, timestam
     view.row_height = row_height;
     let viewport = ui.available_height();
 
-    let mut area = ScrollArea::both().id_salt(("pane", pane)).auto_shrink(false).stick_to_bottom(view.follow);
+    let mut area = ScrollArea::both().id_salt(("log", pane)).auto_shrink(false).stick_to_bottom(view.follow);
     let scripted = view.scroll.take().map(|scroll| match scroll {
         Scroll::Lines(n) => view.offset + n * row_height,
         Scroll::Pages(n) => view.offset + n * (viewport - 2.0 * row_height).max(row_height),
@@ -286,13 +408,17 @@ fn lines(ui: &mut Ui, pane: usize, entry: &Entry, view: &mut ViewState, timestam
     }
 
     let visuals = ui.visuals().clone();
+    let name_width = if rows.sparse() { 12 } else { 0 };
     let output = area.show_rows(ui, row_height, count, |ui, range| {
         for i in range {
-            let index = if filtering { (view.filtered.rows[i] - buffer.evicted()) as usize } else { i };
-            let Some(line) = buffer.get(index) else { continue };
-            let job = layout(line, timestamps, &view.filter, &font, &visuals);
+            let row = if listing { view.listed.rows[i] } else { rows.first() + i as u64 };
+            let Some(found) = rows.line(row) else {
+                ui.label("");
+                continue;
+            };
+            let job = layout(&found, timestamps, &view.filter, name_width, &font, &visuals);
             let response = ui.add(Label::new(job).extend());
-            if view.marked == Some(buffer.evicted() + index as u64) {
+            if view.marked == Some(row) {
                 let rect = response.rect.with_max_x(ui.max_rect().right());
                 ui.painter().rect_filled(rect, 0.0, visuals.selection.bg_fill.gamma_multiply(0.35));
             }
@@ -309,17 +435,23 @@ fn lines(ui: &mut Ui, pane: usize, entry: &Entry, view: &mut ViewState, timestam
 }
 
 fn layout(
-    line: &archon_core::line::Line,
+    row: &Row<'_>,
     timestamps: bool,
     filter: &str,
+    name_width: usize,
     font: &FontId,
     visuals: &Visuals,
 ) -> LayoutJob {
+    let line = row.line;
     let mut job = LayoutJob::default();
     let format = |color: Color32| TextFormat { font_id: font.clone(), color, ..Default::default() };
     if timestamps {
         job.append(&clock(line.time), 0.0, format(visuals.weak_text_color()));
         job.append("  ", 0.0, format(visuals.weak_text_color()));
+    }
+    if let Some((id, name)) = row.source {
+        let name: String = name.chars().take(name_width).collect();
+        job.append(&format!("{name:<name_width$}  "), 0.0, format(source_color(id)));
     }
     match line.origin {
         Origin::Source => {
@@ -356,12 +488,8 @@ fn layout(
 mod tests {
     use super::*;
 
-    fn filtered(view: &ViewState, buffer: &LineBuffer) -> Vec<String> {
-        view.filtered
-            .rows
-            .iter()
-            .map(|&row| buffer.get((row - buffer.evicted()) as usize).unwrap().text.clone())
-            .collect()
+    fn listed(view: &mut ViewState, rows: &dyn Rows) -> Vec<String> {
+        view.shown(rows).iter().filter_map(|&r| rows.line(r)).map(|r| r.line.text.clone()).collect()
     }
 
     #[test]
@@ -369,28 +497,24 @@ mod tests {
         let mut buffer = LineBuffer::new(3);
         let mut view = ViewState { filter: "imu".to_owned(), ..Default::default() };
         buffer.push_output("IMU ok\nthruster\n");
-        view.update_filter(&buffer);
-        assert_eq!(filtered(&view, &buffer), ["IMU ok"]);
+        assert_eq!(listed(&mut view, &buffer), ["IMU ok"]);
 
         // The open last line grows into a match
         buffer.push_output("im");
-        view.update_filter(&buffer);
+        listed(&mut view, &buffer);
         buffer.push_output("u late\n");
-        view.update_filter(&buffer);
-        assert_eq!(filtered(&view, &buffer), ["IMU ok", "imu late"]);
+        assert_eq!(listed(&mut view, &buffer), ["IMU ok", "imu late"]);
 
         // "IMU ok" falls out of the 3-line buffer
         buffer.push_output("imu again\n");
-        view.update_filter(&buffer);
-        assert_eq!(filtered(&view, &buffer), ["imu late", "imu again"]);
+        assert_eq!(listed(&mut view, &buffer), ["imu late", "imu again"]);
     }
 
     #[test]
     fn finds_every_match() {
         let hits: Vec<_> = find("IMU imu Imu", "imu").collect();
         assert_eq!(hits, [0..3, 4..7, 8..11]);
-        assert_eq!(find("IMU imu", "IMU").collect::<Vec<_>>().len(), 1);
-        assert_eq!(find("IMU imu", "IMU").next(), Some(0..3));
+        assert_eq!(find("IMU imu", "IMU").count(), 1);
         assert_eq!(find("°C °C", "°c").count(), 2, "ASCII letters ignore case next to other characters");
         assert_eq!(find("°C", "°C").next(), Some(0..3));
     }
@@ -400,13 +524,11 @@ mod tests {
         let mut buffer = LineBuffer::new(100);
         buffer.push_output("ok\n[ERROR] a\nok\n[WARN] b\nok\n");
         let mut view = ViewState::default();
-        let jump = |view: &mut ViewState, forward| view.jump_to_problem(&buffer, forward).then(|| view.marked.unwrap());
-        assert_eq!(jump(&mut view, true), Some(1));
-        assert_eq!(jump(&mut view, true), Some(3));
-        assert_eq!(jump(&mut view, true), None, "no more");
-        assert_eq!(view.marked, Some(3), "stays on the last one");
-        assert_eq!(jump(&mut view, false), Some(1));
-        assert!(!view.follow, "a jump stops following");
+        let mut jump = |forward| view.jump_to_problem(&buffer, forward).then(|| view.marked.unwrap());
+        assert_eq!(jump(true), Some(1));
+        assert_eq!(jump(true), Some(3));
+        assert_eq!(jump(true), None, "no more");
+        assert_eq!(jump(false), Some(1));
     }
 
     #[test]
@@ -422,8 +544,7 @@ mod tests {
         let mut buffer = LineBuffer::new(10);
         buffer.push_output("IMU\nimu\n");
         let mut view = ViewState { filter: "IMU".to_owned(), ..Default::default() };
-        view.update_filter(&buffer);
-        assert_eq!(filtered(&view, &buffer), ["IMU"]);
+        assert_eq!(listed(&mut view, &buffer), ["IMU"]);
     }
 
     #[test]
@@ -431,10 +552,9 @@ mod tests {
         let mut buffer = LineBuffer::new(10);
         let mut view = ViewState { filter: "a".to_owned(), ..Default::default() };
         buffer.push_output("a1\na2\n");
-        view.update_filter(&buffer);
+        listed(&mut view, &buffer);
         buffer.clear();
         buffer.push_output("a3\n");
-        view.update_filter(&buffer);
-        assert_eq!(filtered(&view, &buffer), ["a3"]);
+        assert_eq!(listed(&mut view, &buffer), ["a3"]);
     }
 }

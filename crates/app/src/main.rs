@@ -1,19 +1,33 @@
 //! archon: a keyboard-driven native GUI for ROS 2 firmware testing.
 
 mod app;
+mod bench;
+mod bytes;
+mod health;
+mod inspector;
 mod keymap;
+mod layout;
+mod logview;
+mod persist;
 mod picker;
-mod view;
+mod plot;
+mod publish;
+mod sidebar;
+mod topics;
+mod welcome;
 
 use std::path::PathBuf;
 
 use archon_core::profile::Profile;
 
 const USAGE: &str = "\
-usage: archon [--no-ros] [PROFILE]
+usage: archon [--no-ros] [--isolated] [--simulate IMAGE] [PROFILE]
 
 Runs the test bench in PROFILE, or in the nearest archon.toml in this directory or above.
---no-ros leaves out the ROS graph (topics and echoes).
+--no-ros          leaves out the ROS graph (topics and echoes).
+--isolated        runs on a ROS network of this window's own (a Fast DDS discovery server it starts), so two boards
+                  with the same topics, each in its own window, don't mix. Without PROFILE it starts empty.
+--simulate IMAGE  simulates a firmware build (a *_with_bl.uf2) on start, as Space n f does.
 Keybindings can be changed in ~/.config/archon/keymap.toml.";
 
 fn main() -> eframe::Result {
@@ -23,11 +37,27 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let with_ros = !args.iter().any(|a| a == "--no-ros");
-    args.retain(|a| a != "--no-ros");
+    let isolated = args.iter().any(|a| a == "--isolated");
+    let simulate = args.iter().position(|a| a == "--simulate").map(|at| {
+        let image = args.get(at + 1).map(PathBuf::from);
+        args.drain(at..(at + 2).min(args.len()));
+        image
+    });
+    args.retain(|a| a != "--no-ros" && a != "--isolated");
 
     let mut problems = Vec::new();
+    let simulate = match simulate {
+        Some(None) => {
+            eprintln!("--simulate needs a firmware image\n\n{USAGE}");
+            std::process::exit(2);
+        }
+        Some(Some(image)) => Some(image),
+        None => None,
+    };
     let path = match args.first() {
         Some(path) => Some(PathBuf::from(path)),
+        // An isolated window is for a second board, so it doesn't bring up this folder's bench again
+        None if isolated => None,
         None => std::env::current_dir().ok().and_then(|dir| Profile::find(&dir)),
     };
     let profile = match &path {
@@ -46,6 +76,50 @@ fn main() -> eframe::Result {
         }
     }
 
+    // An isolated window, and everything it starts, joins the network of a discovery server of its own
+    let discovery = if isolated {
+        match bench::free_discovery_port() {
+            Some(port) => {
+                for (key, value) in bench::isolated_env(port) {
+                    // SAFETY: no other threads exist yet
+                    unsafe { std::env::set_var(key, value) };
+                }
+                if !bench::on_path("fast-discovery-server") {
+                    problems.push(
+                        "fast-discovery-server isn't on the PATH (it comes with Fast DDS, in the ROS shell), so this \
+                         window's ROS network has no server"
+                            .to_owned(),
+                    );
+                }
+                Some(port)
+            }
+            None => {
+                problems.push(
+                    "no free port for a discovery server (tried 11811 to 11910), so this window isn't isolated"
+                        .to_owned(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Joining someone's discovery server, see the whole network, not only the topics archon itself uses
+    if std::env::var_os("ROS_DISCOVERY_SERVER").is_some() && std::env::var_os("ROS_SUPER_CLIENT").is_none() {
+        // SAFETY: no other threads exist yet
+        unsafe { std::env::set_var("ROS_SUPER_CLIENT", "TRUE") };
+    }
+
+    let config_path = dirs::config_dir().map(|dir| dir.join("archon").join("config.toml"));
+    let config = match config_path.as_deref().map(bench::Config::load) {
+        Some(Ok(config)) => config,
+        Some(Err(why)) => {
+            problems.push(why);
+            bench::Config::default()
+        }
+        None => bench::Config::default(),
+    };
+
     let mut keymap = keymap::Keymap::defaults();
     let keymap_path = dirs::config_dir().map(|dir| dir.join("archon").join("keymap.toml"));
     if let Some(keymap_path) = keymap_path.filter(|p| p.is_file())
@@ -54,13 +128,16 @@ fn main() -> eframe::Result {
         problems.push(format!("{e:#}"));
     }
 
-    let title = match profile.path.as_ref().and_then(|p| p.canonicalize().ok()) {
+    let mut title = match profile.path.as_ref().and_then(|p| p.canonicalize().ok()) {
         Some(path) => {
             let dir = path.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
             format!("archon — {}", dir.unwrap_or_default())
         }
         None => "archon".to_owned(),
     };
+    if let Some(port) = discovery {
+        title.push_str(&format!(" (isolated :{port})"));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
@@ -71,6 +148,14 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "archon",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ArchonApp::new(cc, profile, keymap, problems, with_ros)))),
+        Box::new(move |cc| {
+            // An empty isolated window has nothing of its own to restore
+            let state_file = match (&profile.path, discovery) {
+                (None, Some(_)) => None,
+                (path, _) => persist::state_file(path.as_deref()),
+            };
+            let startup = app::Startup { profile, keymap, problems, with_ros, state_file, config, discovery, simulate };
+            Ok(Box::new(app::ArchonApp::new(cc, startup)))
+        }),
     )
 }

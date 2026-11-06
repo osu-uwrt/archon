@@ -6,6 +6,7 @@
 
 mod echo;
 mod rcl;
+mod topic;
 mod typesupport;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 pub use echo::EchoSource;
+pub use topic::{RAW_KEEP, Rate, RawMessage, SERIES_LEN, TopicState, Watcher};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Topic {
@@ -21,6 +23,8 @@ pub struct Topic {
     /// Usually one; more means publishers disagree, which is worth showing
     pub types: Vec<String>,
     pub publishers: usize,
+    /// archon's own subscriptions count too
+    pub subscribers: usize,
 }
 
 /// A snapshot of the graph, refreshed about once a second
@@ -55,13 +59,31 @@ pub struct Options {
 pub struct Ros {
     commands: Sender<Command>,
     graph: Arc<Mutex<Arc<Graph>>>,
+    /// Publishing failures, until taken
+    errors: Arc<Mutex<Vec<String>>>,
     next_id: AtomicU64,
     thread: Option<JoinHandle<()>>,
 }
 
 enum Command {
-    Subscribe { id: SubscriptionId, topic: String, ty: String, callback: Callback },
+    Subscribe {
+        id: SubscriptionId,
+        topic: String,
+        ty: String,
+        callback: Callback,
+    },
     Unsubscribe(SubscriptionId),
+    /// Makes the publisher ahead of the first message, so subscribers have matched it by then
+    Advertise {
+        topic: String,
+        ty: String,
+    },
+    /// A serialized message to publish; the publisher is made the first time and kept
+    Publish {
+        topic: String,
+        ty: String,
+        bytes: Vec<u8>,
+    },
     Shutdown,
 }
 
@@ -71,12 +93,13 @@ impl Ros {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let graph = Arc::new(Mutex::new(Arc::new(Graph::default())));
-        let shared = graph.clone();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let (shared, errors_shared) = (graph.clone(), errors.clone());
         let thread = std::thread::Builder::new()
             .name("ros".to_owned())
-            .spawn(move || rcl::run(options, receiver, shared, wake, ready_tx))?;
+            .spawn(move || rcl::run(options, receiver, shared, errors_shared, wake, ready_tx))?;
         ready_rx.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the ROS thread died starting up")))?;
-        Ok(Ros { commands, graph, next_id: AtomicU64::new(1), thread: Some(thread) })
+        Ok(Ros { commands, graph, errors, next_id: AtomicU64::new(1), thread: Some(thread) })
     }
 
     pub fn graph(&self) -> Arc<Graph> {
@@ -93,6 +116,23 @@ impl Ros {
 
     pub fn unsubscribe(&self, id: SubscriptionId) {
         let _ = self.commands.send(Command::Unsubscribe(id));
+    }
+
+    /// Gets ready to publish to `topic`: subscribers find a publisher in the background, which takes a moment
+    pub fn advertise(&self, topic: &str, ty: &str) {
+        let _ = self.commands.send(Command::Advertise { topic: topic.to_owned(), ty: ty.to_owned() });
+    }
+
+    /// Publishes a serialized (CDR) message of type `ty`. It waits a moment for a subscriber to match the
+    /// publisher, so a message to a subscriber that's there isn't lost. Failures, and messages nothing subscribed to,
+    /// show up in [`Ros::take_errors`].
+    pub fn publish(&self, topic: &str, ty: &str, bytes: Vec<u8>) {
+        let _ = self.commands.send(Command::Publish { topic: topic.to_owned(), ty: ty.to_owned(), bytes });
+    }
+
+    /// Publishing failures since the last call
+    pub fn take_errors(&self) -> Vec<String> {
+        std::mem::take(&mut self.errors.lock().unwrap())
     }
 }
 
