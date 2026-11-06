@@ -1,0 +1,21 @@
+# Copy to archon.toml in the project you're testing (archon looks in the current directory and above),
+# or pass a path: archon path/to/bench.toml
+
+# Environment for every process
+env = { RMW_IMPLEMENTATION = "rmw_fastrtps_cpp" }
+
+[[process]]
+name = "agent"
+cmd = "ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/serial/by-id/usb-..."
+autostart = true
+restart = "on-failure"      # never (default) | on-failure | always
+# cwd = "relative/to/this/file"
+# env = { ROS_DOMAIN_ID = "7" }
+
+[[serial]]
+name = "debug"
+# by-id paths survive the board re-enumerating after a flash
+port = "/dev/serial/by-id/usb-..."
+baud = 115200
+# autostart = true          # the default for serial ports
+# line_ending = "lf"        # lf (default) | crlf | cr | none, appended to what you send

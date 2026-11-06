@@ -1,0 +1,33 @@
+# A bench that needs no hardware and no ROS, for trying archon out:
+#   cargo run -- examples/demo.toml
+
+[[process]]
+name = "ticker"
+cmd = '''
+i=0
+while true; do
+  echo "[INFO] [$(date +%s.%N)] [ticker]: tick $i"
+  (( i % 7 == 6 )) && echo "[WARN] [$(date +%s.%N)] [ticker]: tick took 31 ms"
+  i=$((i + 1))
+  sleep 0.2
+done
+'''
+autostart = true
+
+[[process]]
+name = "flaky"
+cmd = "echo 'thruster driver up'; sleep 3; echo '[ERROR] lost heartbeat from ESC 3'; exit 1"
+autostart = true
+restart = "on-failure"
+
+[[process]]
+name = "echo"
+# Press i to type into it
+cmd = "while read -r line; do echo \"got: $line\"; done"
+autostart = true
+
+[[serial]]
+name = "board"
+# Waits for the device and reconnects whenever it comes back
+port = "/dev/ttyACM0"
+baud = 115200

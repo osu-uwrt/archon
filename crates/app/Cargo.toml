@@ -1,0 +1,21 @@
+[package]
+name = "archon"
+description = "A keyboard-driven native GUI for ROS 2 firmware testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+archon-core.workspace = true
+archon-sources.workspace = true
+anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+nucleo-matcher.workspace = true
+toml.workspace = true
+serde.workspace = true
+dirs.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }

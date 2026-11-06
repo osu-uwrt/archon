@@ -1,0 +1,13 @@
+[package]
+name = "archon-sources"
+description = "Line sources for archon: supervised processes and serial ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+archon-core.workspace = true
+anyhow.workspace = true
+portable-pty.workspace = true
+serialport.workspace = true
+libc.workspace = true
