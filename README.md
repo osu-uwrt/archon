@@ -49,6 +49,10 @@ source /opt/ros/humble/setup.bash
 cargo build --release
 ```
 
+**In your app launcher:** `packaging/archon.desktop` and `packaging/archon.svg` add archon to any launcher that lists
+desktop entries. Copy the entry to `~/.local/share/applications/` (pointing its `Exec` at your `archon`, or a script that
+sources ROS first) and the icon to `~/.local/share/icons/hicolor/scalable/apps/`.
+
 ## Running it
 
 `archon` in a folder with an `archon.toml` (or below one) brings that bench up; `archon path/to/bench.toml` runs a

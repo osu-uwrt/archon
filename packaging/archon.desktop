@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=archon
+GenericName=ROS firmware test bench
+Comment=Agents, serial consoles, CAN, topics, plots and flashing in one window
+Exec=archon
+Icon=archon
+Terminal=false
+Categories=Development;Electronics;
+Keywords=ros;ros2;micro-ros;firmware;serial;can;uwrt;
+StartupWMClass=archon

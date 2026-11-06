@@ -22,13 +22,20 @@ jobs:
           apt-get install -y --no-install-recommends build-essential curl ca-certificates git libclang-dev pkg-config
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - name: Build
         shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           cargo build --release --locked -p archon
+      - name: Check it runs
+        # In this clean ROS container: every library it links is found once ROS is sourced, and it starts
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          if ldd target/release/archon | grep "not found"; then exit 1; fi
+          target/release/archon --help
       - name: Package
         shell: bash
         run: |
@@ -38,11 +45,11 @@ jobs:
           cp -r examples "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "ARCHIVE=dist/$name.tar.gz" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: archon-x86_64-linux-ros-humble
           path: ${{ env.ARCHIVE }}
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: ${{ env.ARCHIVE }}
