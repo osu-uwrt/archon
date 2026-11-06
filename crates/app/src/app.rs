@@ -127,6 +127,10 @@ pub struct ArchonApp {
     discovery: Option<u16>,
     /// The robot file being written, in its view
     builder: Option<crate::builder::Builder>,
+    /// Flashes started here, so a finished one makes way for the next
+    flashes: Vec<SourceId>,
+    /// The line of each flash's output whose question has been put to the user
+    asked: HashMap<SourceId, u64>,
     /// The board file of each simulator started here, to tell when another copy of a board would mix topics with it
     simulated: Vec<(SourceId, PathBuf)>,
     /// The arguments of the windows opened, in place of opening them
@@ -146,6 +150,12 @@ enum Pick {
     Simulate(Vec<Simulatable>),
     /// A build to add to the robot being written
     RobotBoard(Vec<bench::Firmware>),
+    /// A build to flash
+    Flash(Vec<bench::Firmware>),
+    /// How much of a build to flash: the build's name, and its images
+    FlashMode(String, Vec<(crate::flash::Mode, PathBuf)>),
+    /// The answer to upload_tool's question, for this flash: what to type for each choice
+    FlashAnswer(SourceId, Vec<String>),
 }
 
 /// What Space n f can run
@@ -285,6 +295,8 @@ impl ArchonApp {
             discovery,
             simulated: Vec::new(),
             builder: None,
+            flashes: Vec::new(),
+            asked: HashMap::new(),
             #[cfg(test)]
             spawned: Vec::new(),
         };
@@ -623,6 +635,7 @@ impl ArchonApp {
             Command::SaveBench => self.save_bench(),
             Command::Simulate => self.pick_firmware(),
             Command::NewRobot => self.open_builder(),
+            Command::Flash => self.pick_flash(),
             Command::OpenIsolated => self.open_isolated(None),
             Command::CopyRosEnv => match std::env::var("ROS_DISCOVERY_SERVER") {
                 Ok(server) => {
@@ -1246,6 +1259,141 @@ impl ArchonApp {
         self.picking = Some(Pick::Simulate(choices));
     }
 
+    fn flash_tool(&self) -> Result<crate::flash::Tool, String> {
+        let home = dirs::home_dir().unwrap_or_default();
+        crate::flash::find(self.config.upload_tool.as_deref(), crate::robot::titan_firmware_dir(&home).as_deref())
+    }
+
+    /// Lists the builds to flash, with what each one is
+    fn pick_flash(&mut self) {
+        let tool = match self.flash_tool() {
+            Ok(tool) => tool,
+            Err(why) => return self.flash(why, true),
+        };
+        let builds = bench::firmware_builds(&dirs::home_dir().unwrap_or_default());
+        if builds.is_empty() {
+            return self
+                .flash("no titan_firmware builds found (looked for *_with_bl.uf2 under ~/dev/*/titan_firmware)", true);
+        }
+        let items = builds
+            .iter()
+            .map(|build| {
+                let info = crate::flash::info(&tool, &build.image).unwrap_or_default();
+                let ago = build.built.and_then(|t| t.elapsed().ok()).map(|age| match age.as_secs() {
+                    s @ 0..3600 => format!("built {} min ago", s / 60),
+                    s @ 3600..86400 => format!("built {} h ago", s / 3600),
+                    s => format!("built {} days ago", s / 86400),
+                });
+                let detail =
+                    [info.board, info.source].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+                OptionItem {
+                    label: build.name.clone(),
+                    detail: if detail.is_empty() { build.image.display().to_string() } else { detail },
+                    hint: ago.unwrap_or_default(),
+                }
+            })
+            .collect();
+        self.picker = Some(Picker::options(&format!("Flash which build? ({})", tool.name()), items));
+        self.picking = Some(Pick::Flash(builds));
+    }
+
+    /// Asks whether to flash the application or the whole image
+    fn pick_flash_mode(&mut self, firmware: &bench::Firmware) {
+        let images = crate::flash::images(firmware);
+        let items = images
+            .iter()
+            .map(|(mode, image)| {
+                let file = image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                match mode {
+                    crate::flash::Mode::App => OptionItem {
+                        label: "The application".to_owned(),
+                        detail: format!("{file} · keeps the board's bootloader"),
+                        hint: "usual".to_owned(),
+                    },
+                    crate::flash::Mode::Full => OptionItem {
+                        label: "Everything, bootloader too".to_owned(),
+                        detail: format!("{file} · a new board, or one without the titan bootloader"),
+                        hint: "-f".to_owned(),
+                    },
+                }
+            })
+            .collect();
+        self.picker = Some(Picker::options(&format!("Flash how much of {}?", firmware.name), items));
+        self.picking = Some(Pick::FlashMode(firmware.name.clone(), images));
+    }
+
+    /// Flashes an image as a source of its own, whose output shows how it goes
+    pub(crate) fn flash_board(&mut self, name: &str, image: &std::path::Path, mode: crate::flash::Mode) {
+        let tool = match self.flash_tool() {
+            Ok(tool) => tool,
+            Err(why) => return self.flash(why, true),
+        };
+        // An earlier flash that's done makes way, so they don't pile up in the sidebar
+        let done: Vec<SourceId> = self
+            .flashes
+            .iter()
+            .copied()
+            .filter(|id| {
+                let entry = &self.sup.entries()[*id];
+                !entry.removed && !entry.status.is_active()
+            })
+            .collect();
+        for id in done {
+            self.remove_source(id, false);
+        }
+        self.flashes.retain(|id| !self.sup.entries()[*id].removed);
+        let cwd = match &tool {
+            // upload_tool reads its device list from beside it
+            crate::flash::Tool::UploadTool(binary) => binary.parent().map(std::path::Path::to_path_buf),
+            crate::flash::Tool::Picotool(_) => None,
+        };
+        let spec = archon_core::profile::ProcessSpec {
+            name: self.unique_name(&format!("flash {name}")),
+            cmd: crate::flash::command(&tool, image, mode),
+            cwd,
+            env: Default::default(),
+            autostart: true,
+            restart: RestartPolicy::Never,
+        };
+        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+        let id = self.sup.add(&spec.name, Box::new(source), RestartPolicy::Never, true, "\n");
+        self.grow_views();
+        self.sup.start(id);
+        self.flashes.push(id);
+        self.show_view(View::Source(id), false);
+        self.flash(format!("flashing {name} with {}; consoles reconnect after", tool.name()), false);
+    }
+
+    /// Puts a question a flash is waiting on (which board? which interface?) to the user as a picker
+    fn answer_flash_questions(&mut self) {
+        if self.picker.is_some() {
+            return;
+        }
+        for id in self.flashes.clone() {
+            let entry = &self.sup.entries()[id];
+            if entry.removed || !entry.status.is_active() {
+                continue;
+            }
+            let line = entry.buffer.total();
+            if self.asked.get(&id) == Some(&line) {
+                continue;
+            }
+            let lines: Vec<String> = entry.buffer.iter().map(|l| l.text.clone()).collect();
+            let Some(question) = crate::flash::question(&lines) else { continue };
+            self.asked.insert(id, line);
+            let name = entry.name.clone();
+            let items = question
+                .choices
+                .iter()
+                .map(|c| OptionItem { label: c.name.clone(), detail: c.detail.clone(), hint: c.reply.clone() })
+                .collect();
+            let replies = question.choices.iter().map(|c| c.reply.clone()).collect();
+            self.picker = Some(Picker::options(&format!("{name}: {} (Esc calls it off)", question.prompt), items));
+            self.picking = Some(Pick::FlashAnswer(id, replies));
+            return;
+        }
+    }
+
     /// Shows the robot file being written, starting one if there isn't one
     fn open_builder(&mut self) {
         let simulator = match self.find_simulator() {
@@ -1416,6 +1564,24 @@ impl ArchonApp {
                 };
                 let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
                 (Added::Process(spec), Box::new(source))
+            }
+            Pick::Flash(builds) => {
+                if let Some(firmware) = builds.get(index).cloned() {
+                    self.pick_flash_mode(&firmware);
+                }
+                return;
+            }
+            Pick::FlashAnswer(id, replies) => {
+                if let Some(reply) = replies.get(index) {
+                    let _ = self.sup.write(id, format!("{reply}\n").as_bytes());
+                }
+                return;
+            }
+            Pick::FlashMode(name, images) => {
+                if let Some((mode, image)) = images.get(index).cloned() {
+                    self.flash_board(&name, &image, mode);
+                }
+                return;
             }
             Pick::RobotBoard(builds) => {
                 let Some(firmware) = builds.get(index).cloned() else { return };
@@ -2392,7 +2558,14 @@ impl ArchonApp {
         let Some(picker) = &mut self.picker else { return };
         match picker.show(ctx, self.sup.entries(), &self.graph.topics, &actions, &self.keymap, &self.recent) {
             picker::Outcome::Open => {}
-            picker::Outcome::Closed => self.picker = None,
+            picker::Outcome::Closed => {
+                self.picker = None;
+                // Not answering upload_tool's question calls the flash off; nothing has been written yet
+                if let Some(Pick::FlashAnswer(id, _)) = self.picking.take() {
+                    self.sup.stop(id);
+                    self.flash("flash called off before anything was written", false);
+                }
+            }
             picker::Outcome::Chose(choice) => {
                 self.picker = None;
                 match choice {
@@ -2644,6 +2817,7 @@ impl eframe::App for ArchonApp {
         }
         self.poll_watchers();
         self.send_repeating(&ctx);
+        self.answer_flash_questions();
         if !self.watches.is_empty() || self.table.measure_all {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -3481,7 +3655,8 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let profile = Profile { path: Some(path.clone()), ..Profile::default() };
         // A stand-in agent that says what it was asked to do
-        let config = bench::Config { micro_ros_agent: Some("echo agent".into()), firmware_simulator: None };
+        let config =
+            bench::Config { micro_ros_agent: Some("echo agent".into()), firmware_simulator: None, upload_tool: None };
         let mut h = Harness::builder().with_size(vec2(1200.0, 700.0)).build_eframe(move |cc| {
             ArchonApp::new(
                 cc,
@@ -4018,6 +4193,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&checkout);
     }
 
+    /// Flashing runs the tool as a source with the image and flags asked for; a finished flash makes way for the next
+    #[test]
+    fn flashes_with_upload_tool_as_a_source() {
+        let dir = std::env::temp_dir().join(format!("archon-flash-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("upload_tool");
+        std::fs::write(&tool, "#!/bin/sh\necho \"upload_tool $*\"\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let (full, ota) = (dir.join("esc_board_with_bl.uf2"), dir.join("esc_board_ota.uf2"));
+        std::fs::write(&full, b"").unwrap();
+        std::fs::write(&ota, b"").unwrap();
+
+        let mut h = harness_with("");
+        h.state_mut().config.upload_tool = Some(tool.clone());
+        let firmware = bench::Firmware { image: full.clone(), name: "esc_board".into(), built: None };
+        h.state_mut().pick_flash_mode(&firmware);
+        assert!(h.state().picker.is_some(), "asks how much to flash");
+        press(&mut h, Modifiers::NONE, Key::Enter);
+        let said = |h: &Harness<'static, ArchonApp>, id: SourceId| {
+            h.state().sup.entries()[id].buffer.iter().map(|l| l.text.clone()).collect::<String>()
+        };
+        let first = h.state().flashes[0];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !said(&h, first).contains("upload_tool") {
+            assert!(Instant::now() < deadline, "{}", said(&h, first));
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(said(&h, first).contains(&format!("upload_tool {}", ota.display())), "the app image, no -f");
+        assert_eq!(h.state().layout.active_view(), View::Source(first), "its output shows");
+        while h.state().sup.entries()[first].status.is_active() {
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        h.state_mut().flash_board("esc_board", &full, crate::flash::Mode::Full);
+        assert!(h.state().sup.entries()[first].removed, "the finished flash made way");
+        let second = *h.state().flashes.last().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !said(&h, second).contains("upload_tool") {
+            assert!(Instant::now() < deadline);
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(said(&h, second).contains(&format!("upload_tool -f {}", full.display())), "{}", said(&h, second));
+    }
+
+    /// Flashes the RP2040 on the desk with what it already runs (titan_firmware's build/archon_test), through
+    /// archon's flash and upload_tool, with its console open; the console has to come back by itself.
+    /// `cargo test -p archon flashes_the_real_board -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn flashes_the_real_board() {
+        let home = dirs::home_dir().unwrap();
+        let titan = crate::robot::titan_firmware_dir(&home).unwrap();
+        let image = titan.join("build/archon_test/out/template_project.uf2");
+        let console = bench::serial_ports()
+            .into_iter()
+            .filter_map(|p| p.path().map(std::path::Path::to_path_buf))
+            .find(|p| p.to_string_lossy().ends_with("-if00"))
+            .expect("the board's console (if00)");
+        let mut h = harness_with(&format!("[[serial]]\nname = \"board\"\nport = \"{}\"\n", console.display()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.state().sup.entries()[0].status != archon_core::source::Status::Running {
+            assert!(Instant::now() < deadline, "the console didn't open");
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        h.state_mut().flash_board("archon test", &image, crate::flash::Mode::Full);
+        let flash = *h.state().flashes.last().unwrap();
+        let output = |h: &Harness<'static, ArchonApp>| -> String {
+            h.state().sup.entries()[flash].buffer.iter().map(|l| format!("{}\n", l.text)).collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut answered = false;
+        while h.state().sup.entries()[flash].status.is_active() {
+            assert!(Instant::now() < deadline, "the flash didn't finish:\n{}", output(&h));
+            h.run_steps(1);
+            // archon asks which board, as upload_tool does for one it doesn't know; answer with this board
+            if let Some(Pick::FlashAnswer(_, _)) = &h.state().picking {
+                let lines: Vec<String> = h.state().sup.entries()[flash].buffer.iter().map(|l| l.text.clone()).collect();
+                let asked = crate::flash::question(&lines).unwrap();
+                println!("archon asked: {} {:?}", asked.prompt, asked.choices);
+                // This board, and yes to its not being a known pico: it's the image it already runs
+                let index = asked
+                    .choices
+                    .iter()
+                    .position(|c| c.detail.contains("E6613852838B7C32") || c.reply == "y")
+                    .expect("an answer for this board");
+                let app = h.state_mut();
+                app.picker = None;
+                app.picked(index);
+                answered = true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        println!("answered a question: {answered}");
+        let entry = &h.state().sup.entries()[flash];
+        let said = output(&h);
+        println!("--- {}\n{said}--- {:?}", entry.name, entry.status);
+        assert_eq!(entry.status, archon_core::source::Status::Exited(Some(0)), "{said}");
+
+        // The console notices the board went away, then picks it up again
+        let mut saw_it_go = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            h.run_steps(1);
+            let status = h.state().sup.entries()[0].status.clone();
+            saw_it_go |= status != archon_core::source::Status::Running;
+            if saw_it_go && status == archon_core::source::Status::Running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the console didn't come back: {status:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let console_said: Vec<String> = h.state().sup.entries()[0].buffer.iter().map(|l| l.text.clone()).collect();
+        println!("--- console\n{}", console_said.join("\n"));
+    }
+
     #[test]
     fn formats_uptime() {
         use crate::sidebar::uptime;
@@ -4075,6 +4370,9 @@ mod tests {
             keys(&mut welcome, "escape");
             keys(&mut welcome, "space n f");
             save(&mut welcome, "firmware-picker");
+            keys(&mut welcome, "escape");
+            keys(&mut welcome, "space n u");
+            save(&mut welcome, "flash-picker");
             keys(&mut welcome, "escape");
             // The robot builder with two IVCs and an ESC board, when there are builds to show
             let home = dirs::home_dir().unwrap();

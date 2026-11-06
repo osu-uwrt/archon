@@ -272,6 +272,8 @@ pub struct Config {
     pub micro_ros_agent: Option<String>,
     /// The firmware_simulator binary, inside its checkout (whose boards/ it uses)
     pub firmware_simulator: Option<PathBuf>,
+    /// titan_firmware's upload_tool, for flashing boards
+    pub upload_tool: Option<PathBuf>,
 }
 
 /// firmware_simulator's binary and its checkout, whose `boards/` describes each board

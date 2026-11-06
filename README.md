@@ -18,6 +18,13 @@ With nothing set up, archon opens on **Getting started**:
    there. It finds the agent on the PATH or in a built workspace like `~/dev/uwrt/micro-ros-agent`; to run it some
    other way, set `micro_ros_agent = "ros2 run micro_ros_agent micro_ros_agent"` in `~/.config/archon/config.toml`.
 2. **Open the board's serial console** (`Space n s`), or **dump a CAN bus** (`Space n c`).
+   - **Flash a board** (`Space n u`): pick a titan_firmware build (each shows its board, branch and commit), then
+     the application (`_ota.uf2`, keeping the board's bootloader: the usual way) or everything (`_with_bl.uf2`,
+     `-f`: a new board). It runs titan_firmware's `upload_tool` (from `tools/upload_tool/build`, the PATH, or
+     `upload_tool = "..."` in `~/.config/archon/config.toml`; picotool if there's none) as a source, so its output
+     shows as it goes. Its questions come up as pickers: which board (a board not in titan_firmware's
+     `DeviceList.jsonc` is always asked about, with its serial number), and yes/no warnings, with no first; Esc calls
+     the flash off before anything is written. The board's console reconnects once it's back.
    - **No board on the desk? Simulate one** (`Space n f`): pick a titan_firmware build (`*_with_bl.uf2`, newest first)
      and archon runs it in firmware_simulator with the agent on its micro-ROS terminal and its console open, like a
      board on USB. It finds the simulator in `~/dev/*/firmware_simulator` (a release build); set
@@ -125,6 +132,7 @@ rest of a sequence with a menu of what can follow.
 | `Ctrl+W h/j/k/l` or `Alt+h/j/k/l` | Move to the pane in that direction; `Ctrl+W w` cycles |
 | `Space n a` / `Space n s` / `Space n c` | Start the micro-ROS agent / open a serial console / dump a CAN bus |
 | `Space n f` | Simulate a robot file or one firmware build in firmware_simulator, with agents and consoles |
+| `Space n u` | Flash a board with upload_tool |
 | `Space n r` | Build a robot file (see [Robots](#robots-several-simulated-boards-at-once)) |
 | `Space n i` | Open an isolated window, on a ROS network of its own (see [Several boards at once](#several-boards-at-once)) |
 | `Space n w` | Save what's open to `archon.toml` |

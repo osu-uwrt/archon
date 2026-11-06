@@ -69,6 +69,14 @@ pub fn show(ui: &mut Ui, facts: &Facts<'_>, key: &dyn Fn(Command) -> String) -> 
             Command::OpenSerial,
             "Open a console",
         );
+        step(
+            ui,
+            "Flash a board",
+            "With titan_firmware's upload_tool: pick a build, then the application or the whole image. The console comes \
+             back by itself once the board does.",
+            Command::Flash,
+            "Flash",
+        );
         if !facts.can.is_empty() {
             let buses: Vec<String> = facts.can.iter().map(Port::label).collect();
             step(ui, "Watch a CAN bus", &format!("Like candump. Buses here: {}.", buses.join(", ")), Command::OpenCan, "Dump a bus");

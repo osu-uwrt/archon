@@ -4,6 +4,7 @@ mod app;
 mod bench;
 mod builder;
 mod bytes;
+mod flash;
 mod health;
 mod inspector;
 mod keymap;
