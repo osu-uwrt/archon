@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 archon-core.workspace = true
 archon-sources.workspace = true
+archon-msg.workspace = true
+archon-ros.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 egui.workspace = true

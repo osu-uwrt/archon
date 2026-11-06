@@ -1,0 +1,9 @@
+[package]
+name = "archon-msg"
+description = "ROS 2 message definitions read at runtime, and a CDR decoder for them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true

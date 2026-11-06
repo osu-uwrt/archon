@@ -1,0 +1,16 @@
+[package]
+name = "archon-ros"
+description = "A small rcl client for archon: the ROS graph and raw subscriptions to any message type"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+archon-core.workspace = true
+archon-msg.workspace = true
+anyhow.workspace = true
+r2r_rcl.workspace = true
+libloading.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

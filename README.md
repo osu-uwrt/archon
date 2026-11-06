@@ -25,7 +25,13 @@ A profile is one test bench: the processes and serial ports to bring up together
   keeps crashing.
 - `[[serial]]` opens a port and reconnects whenever the device comes back, so flashing a board doesn't end the session
   the way it ends `screen`. Use `/dev/serial/by-id/...` paths, which stay the same when the board re-enumerates.
-- `env` applies to every process. Set `RMW_IMPLEMENTATION` there.
+- `[[echo]]` opens a topic echo with the profile (`topic`, and optionally `name` and `type`). It waits for the topic
+  to appear on the graph, so the firmware can come up after archon. `/rosout` reads as log lines from every node.
+- `env` applies to every process. `RMW_*` and `ROS_*` variables also apply to archon's own node, so it joins the same
+  graph. Set `RMW_IMPLEMENTATION` and `ROS_DOMAIN_ID` there.
+
+Every topic on the graph is listed in the sidebar and in `Ctrl+P`; choosing one opens its echo. `--no-ros` leaves ROS
+out entirely. [examples/ros-demo.toml](examples/ros-demo.toml) is a ROS bench that needs no hardware.
 
 Closing archon stops everything it started.
 
@@ -73,6 +79,8 @@ Rebind in `~/.config/archon/keymap.toml`, where `""` unbinds:
 |---|---|
 | `crates/core` | No UI and no ROS: the command set, the `Source` trait, line buffers, ANSI/UTF-8 decoding, profiles |
 | `crates/sources` | The PTY process and serial sources, and the supervisor that runs them and applies restart policy |
+| `crates/msg` | ROS message definitions read from `.msg` files at runtime, and a CDR decoder |
+| `crates/ros` | A small rcl client on its own thread: the graph, and raw subscriptions to any installed message type, whose type support is loaded at runtime. Also the topic echo source. |
 | `crates/app` | The egui app: keymap, picker, log views, headless UI tests |
 
 Every source runs on its own threads and reports through a channel. The UI drains the channel each frame, so it never
@@ -86,12 +94,14 @@ The UI tests drive the app headlessly with egui_kittest. To look at the UI witho
 nix develop -c cargo test -p archon screenshots -- --ignored
 ```
 
+Building needs the ROS environment, which the flake provides. `crates/ros/tests/live.rs` checks the client against a
+real graph, publishing with `ros2 topic pub` on domain 77, localhost only.
+
 ## Roadmap
 
 1. ~~Process supervisor, serial consoles, palette and keymap~~
-2. ROS: topic list, echo and hz, through an rcl backend (r2r) behind a `RosBackend` trait, so `RMW_IMPLEMENTATION`
-   picks Fast DDS (micro-ROS today) or zenoh. Messages are decoded at runtime from `.msg` files, so new firmware
-   messages need no rebuild.
+2. ~~ROS: topic list, echo and rate, through a small rcl client, so `RMW_IMPLEMENTATION` picks Fast DDS (micro-ROS
+   today) or zenoh. Messages are decoded at runtime from `.msg` files, so new firmware messages need no rebuild.~~
 3. Publish and service-call actions saved in the profile and bound to keys
 4. Live plots
 5. Parameters, the node graph, bags; CAN as a source

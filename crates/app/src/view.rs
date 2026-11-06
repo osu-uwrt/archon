@@ -187,6 +187,7 @@ pub fn kind_tag(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Process => "proc",
         SourceKind::Serial => "serial",
+        SourceKind::Topic => "topic",
     }
 }
 

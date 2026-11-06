@@ -11,6 +11,8 @@ pub type SourceId = usize;
 pub enum SourceKind {
     Process,
     Serial,
+    /// A ROS topic echo
+    Topic,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -95,4 +97,9 @@ pub trait Source: Send {
 
     /// Sends input to the source: a process's stdin, or the serial port
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
+
+    /// A live detail for the sidebar while it runs, like a topic's message rate
+    fn detail(&self) -> Option<String> {
+        None
+    }
 }

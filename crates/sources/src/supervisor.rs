@@ -43,6 +43,13 @@ pub struct Entry {
     source: Box<dyn Source>,
 }
 
+impl Entry {
+    /// The source's live detail, such as a topic's message rate
+    pub fn detail(&self) -> Option<String> {
+        self.source.detail()
+    }
+}
+
 pub struct Supervisor {
     entries: Vec<Entry>,
     tx: Sender<Envelope>,
@@ -72,14 +79,15 @@ impl Supervisor {
         supervisor
     }
 
-    fn add(
+    /// Adds a source, such as a topic echo opened from the picker. It starts stopped.
+    pub fn add(
         &mut self,
         name: &str,
         source: Box<dyn Source>,
         restart: RestartPolicy,
         autostart: bool,
         line_ending: &'static str,
-    ) {
+    ) -> SourceId {
         self.entries.push(Entry {
             name: name.to_owned(),
             kind: source.kind(),
@@ -97,6 +105,7 @@ impl Supervisor {
             autostart,
             source,
         });
+        self.entries.len() - 1
     }
 
     pub fn entries(&self) -> &[Entry] {

@@ -2,7 +2,8 @@
 //! starting with `>` finds a command instead. Each command shows its keys, so the picker teaches the keybindings.
 
 use archon_core::command::{COMMANDS, Command};
-use archon_core::source::{SourceId, Status};
+use archon_core::source::{SourceId, SourceKind, Status};
+use archon_ros::Topic;
 use archon_sources::Entry;
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{
@@ -17,12 +18,18 @@ use crate::view::{kind_tag, status_color, status_text};
 const VISIBLE_ROWS: usize = 12;
 const COMMAND_PREFIX: char = '>';
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Choice {
     Command(Command),
     /// `beside` opens it in the other pane
     Source {
         id: SourceId,
+        beside: bool,
+    },
+    /// A topic on the graph without an echo yet
+    Topic {
+        name: String,
+        ty: Option<String>,
         beside: bool,
     },
 }
@@ -69,7 +76,14 @@ impl Picker {
     }
 
     /// `recent` lists commands run from here, most recent first; with no query they come first
-    pub fn show(&mut self, ctx: &Context, sources: &[Entry], keymap: &Keymap, recent: &[Command]) -> Outcome {
+    pub fn show(
+        &mut self,
+        ctx: &Context,
+        sources: &[Entry],
+        topics: &[Topic],
+        keymap: &Keymap,
+        recent: &[Command],
+    ) -> Outcome {
         let mut choose = None;
         let keys = ctx.input_mut(|i| {
             // Shift+Ctrl+P before Ctrl+P, since a Ctrl+P binding also matches with Shift held
@@ -99,7 +113,7 @@ impl Picker {
             _ => {}
         }
 
-        let items = if self.is_commands() { command_items(keymap, recent) } else { source_items(sources) };
+        let items = if self.is_commands() { command_items(keymap, recent) } else { source_items(sources, topics) };
         let ranked = rank(&items, self.search());
         if !ranked.is_empty() {
             if down {
@@ -112,7 +126,7 @@ impl Picker {
         self.selected = self.selected.min(ranked.len().saturating_sub(1));
         if enter || beside {
             return match ranked.get(self.selected) {
-                Some(&(i, _)) => Outcome::Chose(with_beside(items[i].choice, beside)),
+                Some((i, _)) => Outcome::Chose(with_beside(items[*i].choice.clone(), beside)),
                 None => Outcome::Closed,
             };
         }
@@ -153,7 +167,7 @@ impl Picker {
                     for (row, (i, indices)) in ranked.iter().enumerate().skip(first).take(VISIBLE_ROWS) {
                         let clicked = item_row(ui, &items[*i], indices, row == self.selected);
                         if let Some(ctrl) = clicked {
-                            choose = Some(with_beside(items[*i].choice, ctrl));
+                            choose = Some(with_beside(items[*i].choice.clone(), ctrl));
                         }
                     }
                     if ranked.len() > VISIBLE_ROWS {
@@ -175,11 +189,24 @@ impl Picker {
 fn with_beside(choice: Choice, beside: bool) -> Choice {
     match choice {
         Choice::Source { id, .. } => Choice::Source { id, beside },
+        Choice::Topic { name, ty, .. } => Choice::Topic { name, ty, beside },
         command => command,
     }
 }
 
-fn source_items(sources: &[Entry]) -> Vec<Item> {
+/// The sources, then the topics that aren't open as sources yet
+fn source_items(sources: &[Entry], topics: &[Topic]) -> Vec<Item> {
+    let open = |topic: &Topic| sources.iter().any(|s| s.kind == SourceKind::Topic && s.name == topic.name);
+    let topics = topics.iter().filter(|t| !open(t)).map(|topic| Item {
+        choice: Choice::Topic { name: topic.name.clone(), ty: topic.types.first().cloned(), beside: false },
+        label: topic.name.clone(),
+        detail: topic.types.join(", "),
+        hint: match topic.publishers {
+            0 => "no publishers  echo".to_owned(),
+            n => format!("{n} pub  echo"),
+        },
+        status: None,
+    });
     sources
         .iter()
         .enumerate()
@@ -193,6 +220,7 @@ fn source_items(sources: &[Entry]) -> Vec<Item> {
             },
             status: Some(entry.status.clone()),
         })
+        .chain(topics)
         .collect()
 }
 

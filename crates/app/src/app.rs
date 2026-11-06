@@ -1,11 +1,15 @@
 //! The window: sidebar, one or two panes of output, the bars along the bottom, and the overlays.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use archon_core::command::{COMMANDS, Command};
+use archon_core::profile::RestartPolicy;
 use archon_core::profile::{FILE_NAME, Profile};
-use archon_core::source::SourceId;
+use archon_core::source::{SourceId, SourceKind};
+use archon_msg::Registry;
+use archon_ros::{EchoSource, Graph, Ros};
 use archon_sources::{Entry, Supervisor};
 use egui::{
     Align2, CentralPanel, Color32, Context, Event, Id, Key, Margin, Modifiers, Order, Panel, RichText, Sense, TextEdit,
@@ -54,6 +58,15 @@ pub struct ArchonApp {
     /// Problems loading the profile or keymap, shown until dismissed
     problems: Vec<String>,
     flash: Option<Flash>,
+    ros: Result<RosLink, String>,
+    /// The latest graph snapshot, taken each frame
+    graph: Arc<Graph>,
+}
+
+/// The ROS client and the message definitions shared by every topic echo
+struct RosLink {
+    ros: Arc<Ros>,
+    registry: Arc<Mutex<Registry>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -77,9 +90,34 @@ enum RowAction {
 }
 
 impl ArchonApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, profile: Profile, keymap: Keymap, problems: Vec<String>) -> Self {
+    /// `with_ros` joins the ROS graph, which the tests leave out
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        profile: Profile,
+        keymap: Keymap,
+        mut problems: Vec<String>,
+        with_ros: bool,
+    ) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let mut sup = Supervisor::new(&profile, std::sync::Arc::new(move || ctx.request_repaint()));
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
+        let mut sup = Supervisor::new(&profile, wake.clone());
+        let ros = if with_ros {
+            archon_ros::Ros::start(archon_ros::Options::default(), wake)
+                .map(|ros| RosLink { ros: Arc::new(ros), registry: Arc::new(Mutex::new(Registry::from_env())) })
+                .map_err(|e| format!("{e:#}"))
+        } else {
+            Err("started without ROS".to_owned())
+        };
+        for spec in &profile.echoes {
+            match &ros {
+                Ok(link) => {
+                    let echo =
+                        EchoSource::new(link.ros.clone(), link.registry.clone(), &spec.topic, spec.ty.as_deref());
+                    sup.add(spec.name(), Box::new(echo), RestartPolicy::Never, spec.autostart, "\n");
+                }
+                Err(why) => problems.push(format!("can't echo {}: ROS isn't running ({why})", spec.topic)),
+            }
+        }
         sup.start_autostart();
         let sources = sup.entries().len();
         Self {
@@ -104,7 +142,30 @@ impl ArchonApp {
             profile_path: profile.path,
             problems,
             flash: None,
+            ros,
+            graph: Arc::default(),
         }
+    }
+
+    /// Shows a topic's echo, opening one if there isn't one yet
+    fn open_topic(&mut self, topic: &str, ty: Option<&str>, beside: bool) {
+        let existing = self.sup.entries().iter().position(|e| e.kind == SourceKind::Topic && e.name == topic);
+        let id = match (existing, &self.ros) {
+            (Some(id), _) => id,
+            (None, Ok(link)) => {
+                let echo = EchoSource::new(link.ros.clone(), link.registry.clone(), topic, ty);
+                let id = self.sup.add(topic, Box::new(echo), RestartPolicy::Never, false, "\n");
+                self.views.push(ViewState::default());
+                self.seen.push(Seen::default());
+                self.sup.start(id);
+                id
+            }
+            (None, Err(why)) => {
+                self.flash(format!("ROS isn't running: {why}"), true);
+                return;
+            }
+        };
+        if beside { self.open_beside(id) } else { self.focus(id) }
     }
 
     /// The source in the active pane
@@ -348,6 +409,7 @@ impl ArchonApp {
 
         ui.add_space(8.0);
         ui.label(RichText::new("Ctrl+click opens beside · right-click for more").small().weak());
+        let topic_action = self.topics_list(ui);
 
         let ctx = ui.ctx().clone();
         match action {
@@ -356,6 +418,53 @@ impl ArchonApp {
             Some((RowAction::Run(command), id)) => self.run_on(command, id, &ctx),
             None => {}
         }
+        if let Some((topic, ty, beside)) = topic_action {
+            self.open_topic(&topic, ty.as_deref(), beside);
+        }
+    }
+
+    /// Every topic on the graph, like `ros2 topic list` kept up to date. Returns the topic clicked: its name, its
+    /// type, and whether to open it beside.
+    fn topics_list(&self, ui: &mut Ui) -> Option<(String, Option<String>, bool)> {
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("TOPICS").small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.ros.is_ok() {
+                    ui.label(RichText::new(self.graph.topics.len().to_string()).small().weak());
+                }
+            });
+        });
+        ui.add_space(2.0);
+        if let Err(why) = &self.ros {
+            ui.label(RichText::new("ROS isn't running").small().color(ui.visuals().warn_fg_color)).on_hover_text(why);
+            return None;
+        }
+        if self.graph.topics.is_empty() {
+            ui.label(RichText::new("No topics on the graph yet").small().weak());
+        }
+        let open: Vec<&str> =
+            self.sup.entries().iter().filter(|e| e.kind == SourceKind::Topic).map(|e| e.name.as_str()).collect();
+        let mut clicked = None;
+        for topic in &self.graph.topics {
+            ui.horizontal(|ui| {
+                let label = RichText::new(&topic.name).monospace().small();
+                let response = ui.selectable_label(open.contains(&topic.name.as_str()), label);
+                let response = response.on_hover_text(topic.types.join(", "));
+                if response.clicked() {
+                    let beside = ui.input(|i| i.modifiers.command);
+                    clicked = Some((topic.name.clone(), topic.types.first().cloned(), beside));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (text, color) = match topic.publishers {
+                        0 => ("no pub".to_owned(), ui.visuals().warn_fg_color),
+                        n => (format!("{n} pub"), ui.visuals().weak_text_color()),
+                    };
+                    ui.label(RichText::new(text).small().color(color));
+                });
+            });
+        }
+        clicked
     }
 
     fn panes(&mut self, ui: &mut Ui) {
@@ -440,7 +549,10 @@ impl ArchonApp {
         let running = entry.status.is_active() || entry.restart_at.is_some();
         let mut wanted = vec![(Command::QuickOpen, "sources"), (Command::OpenPalette, "commands")];
         if running {
-            wanted.extend([(Command::Stop, "stop"), (Command::Restart, "restart"), (Command::FocusInput, "send")]);
+            wanted.extend([(Command::Stop, "stop"), (Command::Restart, "restart")]);
+            if entry.kind != SourceKind::Topic {
+                wanted.push((Command::FocusInput, "send"));
+            }
         } else {
             wanted.push((Command::Start, "start"));
         }
@@ -685,7 +797,7 @@ impl ArchonApp {
 
     fn picker(&mut self, ctx: &Context) {
         let Some(picker) = &mut self.picker else { return };
-        match picker.show(ctx, self.sup.entries(), &self.keymap, &self.recent) {
+        match picker.show(ctx, self.sup.entries(), &self.graph.topics, &self.keymap, &self.recent) {
             picker::Outcome::Open => {}
             picker::Outcome::Closed => self.picker = None,
             picker::Outcome::Chose(choice) => {
@@ -699,6 +811,7 @@ impl ArchonApp {
                     }
                     Choice::Source { id, beside: true } => self.open_beside(id),
                     Choice::Source { id, beside: false } => self.focus(id),
+                    Choice::Topic { name, ty, beside } => self.open_topic(&name, ty.as_deref(), beside),
                 }
             }
         }
@@ -780,8 +893,11 @@ fn detail(entry: &Entry, ctx: &Context) -> String {
     }
     match &entry.status {
         archon_core::source::Status::Running => {
-            ctx.request_repaint_after(Duration::from_secs(1));
-            format!("running · {}", uptime(entry.started.elapsed()))
+            ctx.request_repaint_after(Duration::from_millis(500));
+            match entry.detail() {
+                Some(detail) => detail,
+                None => format!("running · {}", uptime(entry.started.elapsed())),
+            }
         }
         status => status_text(status),
     }
@@ -804,6 +920,9 @@ impl eframe::App for ArchonApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.sup.poll();
+        if let Ok(link) = &self.ros {
+            self.graph = link.ros.graph();
+        }
 
         Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if self.input.is_some() {
@@ -816,7 +935,9 @@ impl eframe::App for ArchonApp {
             Panel::top("problems").show(ui, |ui| self.problems_bar(ui));
         }
         if self.sidebar {
-            Panel::left("sources").resizable(true).default_size(260.0).show(ui, |ui| self.sidebar(ui));
+            Panel::left("sources").resizable(true).default_size(260.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.sidebar(ui));
+            });
         }
         CentralPanel::default_margins().show(ui, |ui| self.panes(ui));
         self.mark_seen();
@@ -866,9 +987,9 @@ mod tests {
     "#;
 
     fn harness() -> Harness<'static, ArchonApp> {
-        let mut harness = Harness::builder()
-            .with_size(vec2(1200.0, 700.0))
-            .build_eframe(|cc| ArchonApp::new(cc, Profile::parse(PROFILE).unwrap(), Keymap::defaults(), Vec::new()));
+        let mut harness = Harness::builder().with_size(vec2(1200.0, 700.0)).build_eframe(|cc| {
+            ArchonApp::new(cc, Profile::parse(PROFILE).unwrap(), Keymap::defaults(), Vec::new(), false)
+        });
         harness.run_steps(2);
         harness
     }
@@ -1004,6 +1125,8 @@ mod tests {
         let mut h = harness();
         {
             let app = h.state_mut();
+            app.graph = fake_graph();
+            app.ros = Err("fake".to_owned());
             app.sup.start(0);
             app.sup
                 .entry_mut(0)
@@ -1030,6 +1153,34 @@ mod tests {
         press(&mut h, Modifiers::NONE, Key::Questionmark);
         save(&mut h, "keys");
         h.state_mut().sup.stop_all();
+    }
+
+    fn fake_graph() -> Arc<Graph> {
+        let topic = |name: &str, ty: &str, publishers| archon_ros::Topic {
+            name: name.to_owned(),
+            types: vec![ty.to_owned()],
+            publishers,
+        };
+        Arc::new(Graph {
+            topics: vec![
+                topic("/rosout", "rcl_interfaces/msg/Log", 3),
+                topic("/imu/data", "sensor_msgs/msg/Imu", 1),
+                topic("/thrusters/forces", "riptide_msgs2/msg/ThrusterForces", 0),
+            ],
+        })
+    }
+
+    #[test]
+    fn ctrl_p_lists_topics_too() {
+        let mut h = harness();
+        h.state_mut().graph = fake_graph();
+        press(&mut h, Modifiers::CTRL, Key::P);
+        type_text(&mut h, "/imu/d");
+        press(&mut h, Modifiers::NONE, Key::Enter);
+        // Without ROS the echo can't open, and says why instead of doing nothing
+        let flash = h.state().flash.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+        assert!(flash.starts_with("ROS isn't running"), "{flash}");
+        assert_eq!(h.state().current(), Some(0));
     }
 
     #[test]

@@ -10,17 +10,20 @@ use std::path::PathBuf;
 use archon_core::profile::Profile;
 
 const USAGE: &str = "\
-usage: archon [PROFILE]
+usage: archon [--no-ros] [PROFILE]
 
 Runs the test bench in PROFILE, or in the nearest archon.toml in this directory or above.
+--no-ros leaves out the ROS graph (topics and echoes).
 Keybindings can be changed in ~/.config/archon/keymap.toml.";
 
 fn main() -> eframe::Result {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
         return Ok(());
     }
+    let with_ros = !args.iter().any(|a| a == "--no-ros");
+    args.retain(|a| a != "--no-ros");
 
     let mut problems = Vec::new();
     let path = match args.first() {
@@ -34,6 +37,14 @@ fn main() -> eframe::Result {
         }),
         None => Profile::default(),
     };
+
+    // archon's own node joins the same graph as the profile's processes
+    for (key, value) in &profile.env {
+        if key.starts_with("RMW_") || key.starts_with("ROS_") {
+            // SAFETY: no other threads exist yet
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
 
     let mut keymap = keymap::Keymap::defaults();
     let keymap_path = dirs::config_dir().map(|dir| dir.join("archon").join("keymap.toml"));
@@ -60,6 +71,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "archon",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ArchonApp::new(cc, profile, keymap, problems)))),
+        Box::new(move |cc| Ok(Box::new(app::ArchonApp::new(cc, profile, keymap, problems, with_ros)))),
     )
 }

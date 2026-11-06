@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/sources", "crates/app"]
+members = ["crates/core", "crates/sources", "crates/msg", "crates/ros", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,8 @@ license = "MIT"
 [workspace.dependencies]
 archon-core = { path = "crates/core" }
 archon-sources = { path = "crates/sources" }
+archon-msg = { path = "crates/msg" }
+archon-ros = { path = "crates/ros" }
 
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
@@ -21,3 +23,5 @@ serialport = { version = "4.10", default-features = false }
 nucleo-matcher = "0.3"
 libc = "0.2"
 dirs = "6"
+r2r_rcl = "0.9.7"
+libloading = "0.8"

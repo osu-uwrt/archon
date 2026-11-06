@@ -28,6 +28,10 @@
         in
         {
           default = pkgs.mkShell {
+            # ROS 2 Humble with the riptide messages, for the ROS backend
+            inputsFrom = [ uwrt.devShells.${pkgs.stdenv.hostPlatform.system}.ros ];
+            # libclang and the C headers for bindgen, which generates the rcl bindings
+            nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
             packages = [
               (pkgs.rust-bin.stable.latest.default.override {
                 extensions = [
@@ -38,7 +42,10 @@
               })
               pkgs.pkg-config
             ];
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+            # Added to the ROS libraries already there rather than replacing them
+            shellHook = ''
+              export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+            '';
           };
         }
       );

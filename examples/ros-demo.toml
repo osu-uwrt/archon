@@ -1,0 +1,23 @@
+# A ROS bench that needs no hardware: two publishers, and echoes of one of them and of every node's logs.
+# Its own domain on localhost only, so it can't see or disturb a robot on the network:
+#   nix develop -c cargo run --release -- examples/ros-demo.toml
+
+env = { ROS_DOMAIN_ID = "77", ROS_LOCALHOST_ONLY = "1" }
+
+[[process]]
+name = "heartbeat"
+cmd = "ros2 topic pub -r 2 /demo/heartbeat std_msgs/msg/String '{data: alive}'"
+autostart = true
+restart = "on-failure"
+
+[[process]]
+name = "cmd_vel"
+cmd = "ros2 topic pub -r 10 /demo/cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.5}, angular: {z: -0.2}}'"
+autostart = true
+
+[[echo]]
+topic = "/demo/heartbeat"
+
+[[echo]]
+topic = "/rosout"
+name = "logs"

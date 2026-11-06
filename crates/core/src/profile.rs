@@ -19,6 +19,9 @@ pub struct Profile {
     pub processes: Vec<ProcessSpec>,
     #[serde(default, rename = "serial")]
     pub serials: Vec<SerialSpec>,
+    /// ROS topics to echo, opened with the profile
+    #[serde(default, rename = "echo")]
+    pub echoes: Vec<EchoSpec>,
     /// The file this was loaded from
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -53,6 +56,25 @@ pub struct SerialSpec {
     /// Appended to each line sent from the input bar
     #[serde(default)]
     pub line_ending: LineEnding,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct EchoSpec {
+    pub topic: String,
+    /// Defaults to the topic
+    pub name: Option<String>,
+    /// Like `std_msgs/msg/String`; found on the graph when left out
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+    #[serde(default = "yes")]
+    pub autostart: bool,
+}
+
+impl EchoSpec {
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.topic)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -121,8 +143,9 @@ impl Profile {
     pub fn parse(text: &str) -> anyhow::Result<Profile> {
         let profile: Profile = toml::from_str(text)?;
         let mut names = HashSet::new();
-        let all_names = profile.processes.iter().map(|p| &p.name).chain(profile.serials.iter().map(|s| &s.name));
-        for name in all_names {
+        let all_names = profile.processes.iter().map(|p| p.name.as_str());
+        let all_names = all_names.chain(profile.serials.iter().map(|s| s.name.as_str()));
+        for name in all_names.chain(profile.echoes.iter().map(EchoSpec::name)) {
             if !names.insert(name) {
                 bail!("two sources are named {name:?}");
             }
@@ -155,9 +178,14 @@ mod tests {
             [[serial]]
             name = "debug"
             port = "/dev/ttyACM1"
+
+            [[echo]]
+            topic = "/rosout"
             "#,
         )
         .unwrap();
+        assert_eq!(profile.echoes[0].name(), "/rosout");
+        assert!(profile.echoes[0].autostart);
         assert_eq!(profile.env["RMW_IMPLEMENTATION"], "rmw_fastrtps_cpp");
         assert_eq!(profile.processes[0].restart, RestartPolicy::OnFailure);
         assert_eq!(profile.serials[0].baud, 115_200);
