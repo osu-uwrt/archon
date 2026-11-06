@@ -387,6 +387,7 @@ fn source_items(sources: &[Entry], topics: &[Topic], keymap: &Keymap) -> Vec<Ite
     let views = [
         (View::AllLogs, "All logs", "every source merged in time order", Command::OpenAllLogs),
         (View::Topics, "Topics", "the table of every topic, with rates", Command::OpenTopics),
+        (View::Nodes, "Nodes", "every node, and what it publishes and subscribes to", Command::OpenNodes),
     ]
     .map(|(view, label, detail, command)| Item {
         choice: Choice::View { view, beside: false },

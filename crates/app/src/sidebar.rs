@@ -36,6 +36,7 @@ impl ArchonApp {
             (View::Welcome, "Getting started", Command::ShowWelcome),
             (View::AllLogs, "All logs", Command::OpenAllLogs),
             (View::Topics, "Topics", Command::OpenTopics),
+            (View::Nodes, "Nodes", Command::OpenNodes),
         ] {
             ui.horizontal(|ui| {
                 let response = ui.selectable_label(active == view, label).interact(Sense::drag());

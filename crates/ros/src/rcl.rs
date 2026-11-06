@@ -12,7 +12,7 @@ use anyhow::bail;
 use r2r_rcl::*;
 
 use crate::typesupport::TypeSupports;
-use crate::{Callback, Command, Delivery, Graph, Options, SubscriptionId, Topic};
+use crate::{Callback, Command, Delivery, Graph, NodeInfo, Options, SubscriptionId, Topic};
 
 /// How long a wait for messages lasts, which bounds how late a command is handled
 const WAIT: Duration = Duration::from_millis(20);
@@ -376,7 +376,91 @@ impl Node {
             rcl_names_and_types_fini(&mut found);
         }
         topics.sort_by(|a, b| a.name.cmp(&b.name));
-        Graph { topics }
+        Graph { topics, nodes: self.nodes() }
+    }
+
+    /// Every node but this one, with its publishers, subscribers and services
+    fn nodes(&mut self) -> Vec<NodeInfo> {
+        let mut nodes = Vec::new();
+        // SAFETY: the string arrays and names-and-types are zero-initialized, filled by rcl, read, then finished
+        unsafe {
+            let mut names = rcutils_get_zero_initialized_string_array();
+            let mut namespaces = rcutils_get_zero_initialized_string_array();
+            if rcl_get_node_names(&*self.node, rcutils_get_default_allocator(), &mut names, &mut namespaces)
+                != RCL_RET_OK as i32
+            {
+                rcl_error();
+                return nodes;
+            }
+            let own = CStr::from_ptr(rcl_node_get_name(&*self.node)).to_string_lossy().into_owned();
+            for i in 0..names.size {
+                let (name_c, namespace_c) = (*names.data.add(i), *namespaces.data.add(i));
+                let name = CStr::from_ptr(name_c).to_string_lossy().into_owned();
+                let namespace = CStr::from_ptr(namespace_c).to_string_lossy().into_owned();
+                if name == own || name.is_empty() {
+                    continue;
+                }
+                let read = |found: &mut rcl_names_and_types_t, ret: rcl_ret_t| -> Vec<(String, String)> {
+                    if ret != RCL_RET_OK as i32 {
+                        rcl_error();
+                        return Vec::new();
+                    }
+                    let list = (0..found.names.size)
+                        .map(|j| {
+                            let topic = CStr::from_ptr(*found.names.data.add(j)).to_string_lossy().into_owned();
+                            let types = &*found.types.add(j);
+                            let ty = if types.size > 0 {
+                                CStr::from_ptr(*types.data).to_string_lossy().into_owned()
+                            } else {
+                                String::new()
+                            };
+                            (topic, ty)
+                        })
+                        .collect();
+                    rcl_names_and_types_fini(found);
+                    list
+                };
+                let mut allocator = rcutils_get_default_allocator();
+                let mut found = rmw_get_zero_initialized_names_and_types();
+                let ret = rcl_get_publisher_names_and_types_by_node(
+                    &*self.node,
+                    &mut allocator,
+                    false,
+                    name_c,
+                    namespace_c,
+                    &mut found,
+                );
+                let publishes = read(&mut found, ret);
+                let mut found = rmw_get_zero_initialized_names_and_types();
+                let ret = rcl_get_subscriber_names_and_types_by_node(
+                    &*self.node,
+                    &mut allocator,
+                    false,
+                    name_c,
+                    namespace_c,
+                    &mut found,
+                );
+                let subscribes = read(&mut found, ret);
+                let mut found = rmw_get_zero_initialized_names_and_types();
+                let ret = rcl_get_service_names_and_types_by_node(
+                    &*self.node,
+                    &mut allocator,
+                    name_c,
+                    namespace_c,
+                    &mut found,
+                );
+                let services = read(&mut found, ret);
+                let full =
+                    if namespace.ends_with('/') { format!("{namespace}{name}") } else { format!("{namespace}/{name}") };
+                nodes.push(NodeInfo { name: full, publishes, subscribes, services });
+            }
+            rcutils_string_array_fini(&mut names);
+            rcutils_string_array_fini(&mut namespaces);
+        }
+        nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        // A node that's there twice under one name (a restarted board, say) shows once
+        nodes.dedup_by(|a, b| a.name == b.name);
+        nodes
     }
 }
 

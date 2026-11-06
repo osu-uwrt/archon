@@ -127,6 +127,7 @@ pub struct ArchonApp {
     discovery: Option<u16>,
     /// The robot file being written, in its view
     builder: Option<crate::builder::Builder>,
+    nodes: crate::nodes::NodesState,
     /// Flashes started here, so a finished one makes way for the next
     flashes: Vec<SourceId>,
     /// The line of each flash's output whose question has been put to the user
@@ -154,6 +155,12 @@ enum Pick {
     Flash(Vec<bench::Firmware>),
     /// How much of a build to flash: the build's name, and its images
     FlashMode(String, Vec<(crate::flash::Mode, PathBuf)>),
+    /// Where a second board's agent runs: here, or in an isolated window
+    AgentWhere(Port),
+    /// A bag to play back
+    Bag(Vec<crate::bags::Bag>),
+    /// Once or on a loop, for this bag
+    BagLoop(crate::bags::Bag),
     /// The answer to upload_tool's question, for this flash: what to type for each choice
     FlashAnswer(SourceId, Vec<String>),
 }
@@ -295,6 +302,7 @@ impl ArchonApp {
             discovery,
             simulated: Vec::new(),
             builder: None,
+            nodes: Default::default(),
             flashes: Vec::new(),
             asked: HashMap::new(),
             #[cfg(test)]
@@ -540,7 +548,9 @@ impl ArchonApp {
             View::Topics => Some(&mut self.table.filter),
             View::AllLogs => Some(&mut self.merged.filter),
             View::Source(id) if id < self.views.len() => Some(&mut self.views[id].filter),
-            View::Source(_) | View::Publish(_) | View::Plot(_) | View::Welcome | View::RobotBuilder => None,
+            View::Source(_) | View::Publish(_) | View::Plot(_) | View::Welcome | View::RobotBuilder | View::Nodes => {
+                None
+            }
         }
     }
 
@@ -606,6 +616,7 @@ impl ArchonApp {
             Command::FocusDown => _ = self.layout.focus_direction(Direction::Down),
             Command::OpenAllLogs => self.show_view(View::AllLogs, false),
             Command::OpenTopics => self.show_view(View::Topics, false),
+            Command::OpenNodes => self.show_view(View::Nodes, false),
             Command::MeasureAll => {
                 self.table.measure_all = !self.table.measure_all;
                 let state = if self.table.measure_all { "measuring every topic's rate" } else { "stopped measuring" };
@@ -620,6 +631,7 @@ impl ArchonApp {
             Command::PublishAny => self.picker = Some(Picker::publish()),
             Command::RunAction(n) => self.run_action(usize::from(n) - 1),
             Command::RecordBag => self.record_bag(),
+            Command::PlayBag => self.pick_bag(),
             Command::StartAgent => self.pick_ports(true),
             Command::OpenSerial => self.pick_ports(false),
             Command::OpenCan => {
@@ -787,6 +799,13 @@ impl ArchonApp {
                 }
                 _ => {}
             },
+            View::Nodes => match command {
+                Command::ScrollDown => self.nodes.move_selection(&self.graph, 1),
+                Command::ScrollUp => self.nodes.move_selection(&self.graph, -1),
+                Command::PageDown => self.nodes.move_selection(&self.graph, PAGE),
+                Command::PageUp => self.nodes.move_selection(&self.graph, -PAGE),
+                _ => {}
+            },
             View::RobotBuilder => match command {
                 Command::Send => self.save_robot(false),
                 Command::ToggleRepeat => self.save_robot(true),
@@ -839,6 +858,9 @@ impl ArchonApp {
     /// Starts `ros2 bag record` of every topic into `bags/` beside the profile, as a source of its own. Stopping it
     /// sends Ctrl+C, which closes the bag properly.
     fn record_bag(&mut self) {
+        if !crate::bags::available() {
+            return self.flash(crate::bags::MISSING, true);
+        }
         let dir =
             self.profile_path.as_deref().and_then(|p| p.parent()).map_or_else(|| PathBuf::from("."), PathBuf::from);
         let stamp = logview::file_stamp(std::time::SystemTime::now());
@@ -857,6 +879,62 @@ impl ArchonApp {
         self.sup.start(id);
         self.show_view(View::Source(id), true);
         self.flash(format!("recording to {}; x stops it", out.display()), false);
+    }
+
+    /// Where bags are looked for: the profile's `bags/`, its folder, and the folder archon runs in
+    fn bag_dirs(&self) -> Vec<PathBuf> {
+        let bench = self.profile_path.as_deref().and_then(|p| p.parent()).map(PathBuf::from);
+        let here = std::env::current_dir().ok();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for dir in [bench.clone(), here.clone()].into_iter().flatten() {
+            for candidate in [dir.join("bags"), dir] {
+                if !dirs.contains(&candidate) {
+                    dirs.push(candidate);
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Lists the bags to play, newest first
+    fn pick_bag(&mut self) {
+        if !crate::bags::available() {
+            return self.flash(crate::bags::MISSING, true);
+        }
+        let bags = crate::bags::find(&self.bag_dirs());
+        if bags.is_empty() {
+            let record = self.key_of(Command::RecordBag).unwrap_or_default();
+            return self.flash(format!("no bags here yet ({record} records one into bags/)"), false);
+        }
+        let items = bags
+            .iter()
+            .map(|bag| OptionItem {
+                label: bag.name.clone(),
+                detail: bag.summary(),
+                hint: bag.path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+            })
+            .collect();
+        self.picker = Some(Picker::options("Play which bag?", items));
+        self.picking = Some(Pick::Bag(bags));
+    }
+
+    /// Plays a bag back as a source of its own; `x` stops it
+    fn play_bag(&mut self, bag: &crate::bags::Bag, looped: bool) {
+        let spec = archon_core::profile::ProcessSpec {
+            name: self.unique_name(&format!("play {}", bag.name)),
+            cmd: crate::bags::play_command(bag, looped),
+            cwd: None,
+            env: Default::default(),
+            autostart: true,
+            restart: RestartPolicy::Never,
+        };
+        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+        let id = self.sup.add(&spec.name, Box::new(source), RestartPolicy::Never, true, "\n");
+        self.grow_views();
+        self.sup.start(id);
+        self.show_view(View::Source(id), true);
+        let how = if looped { "on a loop" } else { "once" };
+        self.flash(format!("playing {} {how}; its topics are on the graph now, x stops it", bag.name), false);
     }
 
     /// Opens another archon on a ROS network of its own, simulating `image` there if given
@@ -1364,6 +1442,24 @@ impl ArchonApp {
         self.flash(format!("flashing {name} with {}; consoles reconnect after", tool.name()), false);
     }
 
+    /// Whether a micro-ROS agent is running here already
+    fn agent_running(&self) -> bool {
+        self.sup.live().any(|(_, e)| e.name.starts_with("agent") && e.status.is_active())
+    }
+
+    /// The agent on a port, as a process
+    fn agent_spec(&mut self, port: &Port) -> Result<archon_core::profile::ProcessSpec, String> {
+        let agent = self.find_agent()?;
+        Ok(archon_core::profile::ProcessSpec {
+            name: self.unique_name("agent"),
+            cmd: bench::agent_command(&agent, port),
+            cwd: None,
+            env: Default::default(),
+            autostart: true,
+            restart: RestartPolicy::OnFailure,
+        })
+    }
+
     /// Puts a question a flash is waiting on (which board? which interface?) to the user as a picker
     fn answer_flash_questions(&mut self) {
         if self.picker.is_some() {
@@ -1549,21 +1645,66 @@ impl ArchonApp {
         let Some(pick) = self.picking.take() else { return };
         let (spec, source): (Added, Box<dyn archon_core::source::Source>) = match pick {
             Pick::Agent(ports) => {
-                let Some(port) = ports.get(index) else { return };
-                let agent = match self.find_agent() {
-                    Ok(agent) => agent,
+                let Some(port) = ports.get(index).cloned() else { return };
+                // A second board's agent: the same firmware twice would mix topics here, so ask where it goes
+                if port.path().is_some() && self.agent_running() {
+                    let items = vec![
+                        OptionItem {
+                            label: "Here".to_owned(),
+                            detail: "a different firmware from the board already here: their topics don't collide"
+                                .to_owned(),
+                            hint: String::new(),
+                        },
+                        OptionItem {
+                            label: "In an isolated window".to_owned(),
+                            detail: "the same firmware as the board already here: their topics would mix".to_owned(),
+                            hint: self.key_of(Command::OpenIsolated).unwrap_or_default(),
+                        },
+                    ];
+                    self.picker =
+                        Some(Picker::options("Another agent is running here. Where does this one go?", items));
+                    self.picking = Some(Pick::AgentWhere(port));
+                    return;
+                }
+                match self.agent_spec(&port) {
+                    Ok(spec) => {
+                        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+                        (Added::Process(spec), Box::new(source))
+                    }
                     Err(why) => return self.flash(why, true),
-                };
-                let spec = archon_core::profile::ProcessSpec {
-                    name: self.unique_name("agent"),
-                    cmd: bench::agent_command(&agent, port),
-                    cwd: None,
-                    env: Default::default(),
-                    autostart: true,
-                    restart: RestartPolicy::OnFailure,
-                };
-                let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
-                (Added::Process(spec), Box::new(source))
+                }
+            }
+            Pick::AgentWhere(port) if index == 0 => match self.agent_spec(&port) {
+                Ok(spec) => {
+                    let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+                    (Added::Process(spec), Box::new(source))
+                }
+                Err(why) => return self.flash(why, true),
+            },
+            Pick::AgentWhere(port) => {
+                let Some(path) = port.path() else { return };
+                let args = vec!["--isolated".to_owned(), "--agent".to_owned(), format!("board={}", path.display())];
+                self.open_window(args, true);
+                self.flash(format!("{} runs its agent in an isolated window", port.label()), false);
+                return;
+            }
+            Pick::Bag(bags) => {
+                let Some(bag) = bags.get(index).cloned() else { return };
+                let items = vec![
+                    OptionItem { label: "Once".to_owned(), detail: bag.summary(), hint: String::new() },
+                    OptionItem {
+                        label: "On a loop".to_owned(),
+                        detail: "until it's stopped (x)".to_owned(),
+                        hint: "--loop".to_owned(),
+                    },
+                ];
+                self.picker = Some(Picker::options(&format!("Play {} once, or on a loop?", bag.name), items));
+                self.picking = Some(Pick::BagLoop(bag));
+                return;
+            }
+            Pick::BagLoop(bag) => {
+                self.play_bag(&bag, index == 1);
+                return;
             }
             Pick::Flash(builds) => {
                 if let Some(firmware) = builds.get(index).cloned() {
@@ -1618,6 +1759,7 @@ impl ArchonApp {
                     name: self.unique_name(interface),
                     interface: interface.clone(),
                     autostart: true,
+                    canmore: true,
                 };
                 (Added::Can(spec.clone()), Box::new(archon_sources::can::CanSource::new(spec)))
             }
@@ -1677,7 +1819,14 @@ impl ArchonApp {
         } else {
             ""
         };
-        match std::fs::write(&path, format!("{existing}{separator}{header}{text}")) {
+        let written =
+            std::fs::write(&path, format!("{existing}{separator}{header}{text}")).map_err(anyhow::Error::from);
+        // An isolated window's bench runs isolated when it's opened again
+        let written = written.and_then(|()| match self.discovery {
+            Some(_) => Profile::mark_isolated(&path),
+            None => Ok(()),
+        });
+        match written {
             Ok(()) => {
                 let saved = self.added.len();
                 self.added.clear();
@@ -2059,6 +2208,15 @@ impl ArchonApp {
             View::Plot(_) => {
                 ui.label(RichText::new("This plot is gone").weak());
             }
+            View::Nodes => {
+                let graph = self.graph.clone();
+                if let Some(crate::nodes::Action::OpenTopic(name, ty)) =
+                    crate::nodes::show(ui, pane, &graph, &mut self.nodes)
+                {
+                    let ty = (!ty.is_empty()).then_some(ty);
+                    self.deferred.push(Deferred::OpenTopic { name, ty, beside: false });
+                }
+            }
             View::RobotBuilder => {
                 let keys = [
                     self.key_of(Command::Send).unwrap_or_default(),
@@ -2217,6 +2375,9 @@ impl ArchonApp {
                     (Command::ToggleWatch, "watch"),
                     (Command::MeasureAll, "measure all"),
                 ]);
+            }
+            View::Nodes => {
+                wanted.extend([(Command::ScrollDown, "pick"), (Command::OpenTopics, "topics")]);
             }
             View::RobotBuilder => {
                 wanted.extend([
@@ -2648,6 +2809,7 @@ impl ArchonApp {
                 View::AllLogs => PaneSpec::AllLogs,
                 View::Topics => PaneSpec::Topics,
                 View::Welcome | View::RobotBuilder => PaneSpec::Welcome,
+                View::Nodes => PaneSpec::Nodes,
                 View::Publish(i) => {
                     let p = &self.publishers[i];
                     PaneSpec::Publish { name: p.name.clone(), topic: p.topic.clone(), ty: p.ty.clone() }
@@ -2690,6 +2852,7 @@ impl ArchonApp {
                 },
                 PaneSpec::AllLogs => View::AllLogs,
                 PaneSpec::Topics => View::Topics,
+                PaneSpec::Nodes => View::Nodes,
                 PaneSpec::Welcome => View::Welcome,
                 PaneSpec::Plot { series, seconds } => {
                     let mut plot = Plot::new();
@@ -2958,6 +3121,12 @@ mod tests {
                 topic("/imu/data", "sensor_msgs/msg/Imu", 1),
                 topic("/thrusters/forces", "riptide_msgs2/msg/ThrusterForces", 0),
             ],
+            nodes: vec![archon_ros::NodeInfo {
+                name: "/talos/esc_board".into(),
+                publishes: vec![("/thrusters/forces".into(), "riptide_msgs2/msg/ThrusterForces".into())],
+                subscribes: vec![("/talos/state/kill".into(), "std_msgs/msg/Bool".into())],
+                services: Vec::new(),
+            }],
         })
     }
 
@@ -3431,6 +3600,7 @@ mod tests {
                     publishers: 0,
                     subscribers: 1,
                 }],
+                nodes: Vec::new(),
             });
             app.open_publish("/kill", "std_msgs/msg/Bool");
             let registry = app.registry.clone();
@@ -4313,6 +4483,74 @@ mod tests {
         println!("--- console\n{}", console_said.join("\n"));
     }
 
+    /// A bench saved from an isolated window says so, so it opens isolated again
+    #[test]
+    fn an_isolated_windows_bench_opens_isolated() {
+        let path = std::env::temp_dir().join(format!("archon-isolated-bench-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut h = harness_with("");
+        {
+            let app = h.state_mut();
+            app.discovery = Some(11899);
+            app.profile_path = Some(path.clone());
+            app.attach(&crate::robot::Attach::Console { name: "b_ivc".into(), path: "/tmp/nothing-here".into() });
+            app.save_bench();
+        }
+        let saved = Profile::load(&path).unwrap();
+        assert!(saved.isolated, "{}", std::fs::read_to_string(&path).unwrap());
+        assert_eq!(saved.serials.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A second agent on a real board asks whether it's the same firmware, which goes to an isolated window
+    #[test]
+    fn a_second_board_asks_where_its_agent_goes() {
+        let mut h = harness_with("");
+        // An agent that keeps running (the transport arguments land in a comment)
+        h.state_mut().config.micro_ros_agent = Some("sleep 30 #".into());
+        let ports = || {
+            vec![
+                Port::Serial("/dev/serial/by-id/usb-a-if02".into()),
+                Port::Serial("/dev/serial/by-id/usb-b-if02".into()),
+            ]
+        };
+        h.state_mut().picking = Some(Pick::Agent(ports()));
+        h.state_mut().picked(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !h.state().agent_running() {
+            assert!(Instant::now() < deadline);
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        h.state_mut().picking = Some(Pick::Agent(ports()));
+        h.state_mut().picked(1);
+        assert!(matches!(h.state().picking, Some(Pick::AgentWhere(_))), "asks where");
+        h.state_mut().picked(1);
+        assert_eq!(h.state().spawned.last().unwrap(), &["--isolated", "--agent", "board=/dev/serial/by-id/usb-b-if02"]);
+        let agents =
+            |h: &Harness<'static, ArchonApp>| h.state().sup.live().filter(|(_, e)| e.name.starts_with("agent")).count();
+        assert_eq!(agents(&h), 1, "not here");
+
+        // Different firmware: here
+        h.state_mut().picking = Some(Pick::Agent(ports()));
+        h.state_mut().picked(1);
+        h.state_mut().picked(0);
+        assert_eq!(agents(&h), 2);
+        h.state_mut().sup.stop_all();
+    }
+
+    #[test]
+    fn n_shows_the_nodes() {
+        let mut h = harness();
+        h.state_mut().graph = fake_graph();
+        keys(&mut h, "N");
+        assert_eq!(h.state().layout.active_view(), View::Nodes);
+        keys(&mut h, "j");
+        assert_eq!(h.state().nodes.selected.as_deref(), Some("/talos/esc_board"));
+        use egui_kittest::kittest::Queryable;
+        h.get_by_label("/talos/state/kill");
+    }
+
     #[test]
     fn formats_uptime() {
         use crate::sidebar::uptime;
@@ -4443,6 +4681,12 @@ mod tests {
         keys(&mut h, "[");
         keys(&mut h, "[");
         save(&mut h, "plot");
+        // The nodes on the graph
+        h.state_mut().graph = fake_graph();
+        keys(&mut h, "N");
+        keys(&mut h, "j");
+        save(&mut h, "nodes");
+        keys(&mut h, "escape");
         // A second field joins the same plot
         keys(&mut h, "alt+h");
         keys(&mut h, "k k");

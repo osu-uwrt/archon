@@ -31,6 +31,17 @@ pub struct Topic {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Graph {
     pub topics: Vec<Topic>,
+    /// The other nodes on the graph, and what each one publishes, subscribes to and serves
+    pub nodes: Vec<NodeInfo>,
+}
+
+/// A node, by its full name (`/talos/ivc_board`), with the topics and services it has as (name, type)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeInfo {
+    pub name: String,
+    pub publishes: Vec<(String, String)>,
+    pub subscribes: Vec<(String, String)>,
+    pub services: Vec<(String, String)>,
 }
 
 impl Graph {

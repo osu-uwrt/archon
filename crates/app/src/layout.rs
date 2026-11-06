@@ -20,6 +20,8 @@ pub enum View {
     Welcome,
     /// Writing a robot file
     RobotBuilder,
+    /// The nodes on the graph and what each one has
+    Nodes,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

@@ -51,7 +51,11 @@ to make one, or write it by hand from [archon.example.toml](archon.example.toml)
 - `[[echo]]` opens a topic echo with the profile (`topic`, and optionally `name` and `type`). It waits for the topic
   to appear on the graph, so the firmware can come up after archon. `/rosout` reads as log lines from every node.
 - `[[can]]` dumps a SocketCAN bus (`interface = "can0"`) like `candump`, waiting for the interface and coming back
-  when it does. `i` sends a frame in `cansend` syntax: `123#DEADBEEF`, `12345678#00`, `123#R`.
+  when it does. `i` sends a frame in `cansend` syntax: `123#DEADBEEF`, `12345678#00`, `123#R`. Each frame also says
+  what it is in UWRT's CANmore terms: which board (client ID), which way, and whether it's a heartbeat (mode, error,
+  termination), thruster commands, or part of a micro-ROS message. `canmore = false` turns that off for other buses.
+- `isolated = true` (at the top) runs the bench on a ROS network of its own, as `--isolated` does. A bench saved
+  from an isolated window gets it.
 - `[[publish]]` is a message ready to send (`name`, `topic`, `type`, `value` as a table shaped like the message,
   optionally `rate` and `key`). It's in the sidebar and the palette, and its key sends it, or with a `rate` starts and
   stops sending at that rate.
@@ -88,6 +92,8 @@ The main area tiles into panes like vim windows, each showing one view:
   console, the agent and `/rosout` line up in time.
 - **Topics**: every topic with its type, rate, publishers, subscribers and time since the last message. Sortable by
   clicking a heading, filterable with `/`. Rates show for topics archon listens to; `m` measures every topic's.
+- **Nodes** (`N`): every node on the graph, and what the picked one publishes, subscribes to and serves; click a
+  topic to echo it. For "is the board's node up, and is it listening to what I'm sending?"
 
 The health strip along the top shows each process and port, each watched topic's rate, anything being sent on repeat,
 and errors you haven't seen. Click a chip to go to it.
@@ -97,7 +103,9 @@ pane on that side. Alt+drag a pane to move it the same way, or onto another pane
 drag too. `Esc` goes back to what a pane showed before.
 
 `Space b` records every topic to a bag in `bags/` beside the profile, as a source of its own; stopping it (`x`)
-closes the bag properly.
+closes the bag properly. `Space B` plays one back (once or on a loop), listing the bags there and in the folder
+archon runs in, newest first, with their length and message count. Both need rosbag2, which archon's `nix develop`
+has (the uwrt `ros` shell alone doesn't).
 
 ## Keys
 
@@ -121,7 +129,7 @@ rest of a sequence with a menu of what can follow.
 | `y` | Copy the output shown (just the filtered lines while filtering) |
 | `t` | Timestamps |
 | `Ctrl+L` | Clear the output |
-| `L` / `T` | Show all logs / the topics table |
+| `L` / `T` / `N` | Show all logs / the topics table / the nodes |
 | `v` | A topic: inspector, then raw stream, then bytes |
 | `p` | Plot the inspector's selected field |
 | `P` | Publish to the topic you're on (its echo, or the topics table's row); elsewhere, the same as `Ctrl+O` |
@@ -139,7 +147,7 @@ rest of a sequence with a menu of what can follow.
 | `Delete` / `Space s d` | Remove the source or publisher (also in its right-click menu); if it's in the profile, `y` takes it out of the file too, `n` just for now |
 | `F1` | Getting started |
 | `Space l s` / `Space l l` | Save the layout under a name / load one |
-| `Space b` | Record a bag of every topic |
+| `Space b` / `Space B` | Record a bag of every topic / play one back |
 | `Ctrl+=` / `Ctrl+-` | Zoom |
 | `Ctrl+B` | Toggle the sidebar |
 | `Ctrl+Q` | Quit |
@@ -172,6 +180,10 @@ board that's already simulated in the window (`Space n f`) opens the copy in an 
 To use `ros2` on an isolated window's network from a terminal, run `Copy this window's ROS environment` from the
 palette and paste it there; then use `ros2 ... --no-daemon` (the daemon stays on the network it started on). An
 isolated window with no profile given starts empty rather than loading this folder's `archon.toml`.
+
+For real boards, archon can't tell two titan boards apart over USB (they're all "Micro-ROS Agent"), so starting a
+second agent in a window that has one asks: **here** (a different firmware) or **in an isolated window** (the same
+firmware again).
 
 ## Robots: several simulated boards at once
 
@@ -226,4 +238,7 @@ real graph, publishing with `ros2 topic pub` on domain 77, localhost only.
 3. ~~Topic inspector, merged logs, health strip with rate watches, topics table, tiled layouts saved per profile~~
 4. ~~Publishing, with actions saved in the profile and bound to keys; live plots; message bytes; CAN; bag recording;
    drag-and-drop panes; named layouts~~
-5. Service calls and parameters, the node graph, bag playback, decoding UWRT's CANmore frames
+5. ~~The node graph, bag playback, decoding UWRT's CANmore frames~~; firmware_simulator boards and robots,
+   flashing, isolated ROS networks for duplicate boards
+6. Service calls and parameters: a request form per service type (the publish form's machinery, for `.srv`
+   requests), and reading and setting a node's parameters

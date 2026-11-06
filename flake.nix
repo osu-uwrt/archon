@@ -28,11 +28,17 @@
         in
         {
           default = pkgs.mkShell {
-            # ROS 2 Humble with the riptide messages, for the ROS backend
-            inputsFrom = [ uwrt.devShells.${pkgs.stdenv.hostPlatform.system}.ros ];
-            # libclang and the C headers for bindgen, which generates the rcl bindings
-            nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
+            # The team's ROS shell (ROS 2 Humble with the riptide messages), plus rosbag2 for recording and playing
+            # bags, which that shell leaves out
             packages = [
+              (pkgs.rosPackages.humble.buildEnv {
+                paths = with pkgs.rosPackages.humble; [
+                  ros-core
+                  rosbag2
+                  pkgs.uwrt.riptide-msgs
+                ];
+              })
+              pkgs.colcon
               (pkgs.rust-bin.stable.latest.default.override {
                 extensions = [
                   "rust-src"
@@ -42,6 +48,8 @@
               })
               pkgs.pkg-config
             ];
+            # libclang and the C headers for bindgen, which generates the rcl bindings
+            nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
             # Added to the ROS libraries already there rather than replacing them
             shellHook = ''
               export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}

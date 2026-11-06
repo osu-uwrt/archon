@@ -109,7 +109,7 @@ fn read_bus(spec: &CanSpec, sink: &Sink, stop: &AtomicBool, shared: &Mutex<Optio
                     _ => break Some(error.to_string()),
                 }
             }
-            if !sink.output(format_frame(&spec.interface, &buf[..n as usize])) {
+            if !sink.output(format_frame(&spec.interface, &buf[..n as usize], spec.canmore)) {
                 break None;
             }
         };
@@ -185,8 +185,8 @@ fn sleep_unless(stop: &AtomicBool, duration: Duration) {
     }
 }
 
-/// A frame as `candump` prints it: `  can0  123   [3]  01 02 03`
-pub fn format_frame(interface: &str, frame: &[u8]) -> String {
+/// A frame as `candump` prints it: `  can0  123   [3]  01 02 03`, and with `canmore`, what it is after a `·`
+pub fn format_frame(interface: &str, frame: &[u8], canmore: bool) -> String {
     if frame.len() < 8 {
         return format!("  {interface}  (a {}-byte read, not a frame)\n", frame.len());
     }
@@ -207,7 +207,14 @@ pub fn format_frame(interface: &str, frame: &[u8]) -> String {
     } else {
         data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
     };
-    format!("  {interface}  {id_text} {length}  {body}\n")
+    let meaning = if canmore && id & (CAN_ERR_FLAG | CAN_RTR_FLAG) == 0 {
+        let extended = id & CAN_EFF_FLAG != 0;
+        let bare = id & if extended { CAN_EFF_MASK } else { CAN_SFF_MASK };
+        format!("   · {}", crate::canmore::describe(bare, extended, data))
+    } else {
+        String::new()
+    };
+    format!("  {interface}  {id_text} {length}  {body}{meaning}\n")
 }
 
 /// Parses `cansend` syntax: `123#DEADBEEF` (standard id), `12345678#00` (extended), `123#R` (remote request)
@@ -247,11 +254,21 @@ mod tests {
     #[test]
     fn formats_like_candump() {
         let frame = parse_cansend("123#DEADBEEF").unwrap();
-        assert_eq!(format_frame("can0", &frame), "  can0  123    [4]  DE AD BE EF\n");
+        assert_eq!(format_frame("can0", &frame, false), "  can0  123    [4]  DE AD BE EF\n");
         let frame = parse_cansend("1F334455#11.22").unwrap();
-        assert_eq!(format_frame("can0", &frame), "  can0  1F334455  [2]  11 22\n");
+        assert_eq!(format_frame("can0", &frame, false), "  can0  1F334455  [2]  11 22\n");
         let frame = parse_cansend("7FF#R").unwrap();
-        assert_eq!(format_frame("vcan0", &frame), "  vcan0  7FF    [0]  remote request\n");
+        assert_eq!(format_frame("vcan0", &frame, false), "  vcan0  7FF    [0]  remote request\n");
+    }
+
+    #[test]
+    fn says_what_a_canmore_frame_is() {
+        // Client 2's heartbeat: utility, to the agent, channel 15
+        let frame = parse_cansend("0AF#09").unwrap();
+        assert_eq!(
+            format_frame("can0", &frame, true),
+            "  can0   AF    [1]  09   · client 2 (ESC board 0) → agent heartbeat · normal · ok · #1\n"
+        );
     }
 
     #[test]
@@ -262,6 +279,34 @@ mod tests {
         assert!(parse_cansend("hello").is_err());
     }
 
+    /// Whatever is on vcan0 for three seconds, said in CANmore terms: `cargo test -p archon-sources reads_canmore
+    /// -- --ignored --nocapture` while a simulated robot's bus is on vcan0
+    #[test]
+    #[ignore]
+    fn reads_canmore_off_vcan0() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut source =
+            CanSource::new(CanSpec { name: "bus".into(), interface: "vcan0".into(), autostart: true, canmore: true });
+        source.start(Sink::new(0, 1, tx, Arc::new(|| {})));
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        let mut seen = std::collections::BTreeMap::new();
+        while std::time::Instant::now() < end {
+            if let Ok(archon_core::source::Event::Output(text)) =
+                rx.recv_timeout(Duration::from_millis(100)).map(|e| e.event)
+            {
+                let meaning =
+                    text.split('·').nth(1).map(|m| m.split(" heartbeat").next().unwrap_or(m).trim().to_owned());
+                *seen.entry(meaning.unwrap_or_default()).or_insert(0) += 1;
+                if seen.len() < 12 && seen.values().sum::<i32>() < 40 {
+                    print!("{text}");
+                }
+            }
+        }
+        source.stop();
+        println!("{seen:#?}");
+        assert!(!seen.is_empty(), "nothing on vcan0");
+    }
+
     /// Against a real bus, when there's a vcan0 (`ip link add vcan0 type vcan && ip link set vcan0 up`)
     #[test]
     fn talks_to_vcan0_if_there_is_one() {
@@ -269,7 +314,8 @@ mod tests {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut source = CanSource::new(CanSpec { name: "bus".into(), interface: "vcan0".into(), autostart: true });
+        let mut source =
+            CanSource::new(CanSpec { name: "bus".into(), interface: "vcan0".into(), autostart: true, canmore: false });
         source.start(Sink::new(0, 1, tx, Arc::new(|| {})));
         std::thread::sleep(Duration::from_millis(300));
         // A second socket sends, the source hears it

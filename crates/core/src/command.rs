@@ -52,6 +52,7 @@ pub enum Command {
 
     OpenAllLogs,
     OpenTopics,
+    OpenNodes,
     /// A topic: switch between the inspector and the raw stream
     ToggleStream,
     /// Open what's selected: an inspector branch, a topic in the table
@@ -84,6 +85,8 @@ pub enum Command {
 
     /// Record every topic to a bag, as a source of its own
     RecordBag,
+    /// Play a recorded bag back onto the graph
+    PlayBag,
 
     /// Run the micro-ROS agent on a port picked from a list
     StartAgent,
@@ -170,6 +173,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     hidden(FocusDown, "pane.down", "Pane below"),
     c(OpenAllLogs, "open.logs", "Show all logs merged"),
     c(OpenTopics, "open.topics", "Show topics table"),
+    c(OpenNodes, "open.nodes", "Show the nodes on the graph"),
     c(ToggleStream, "view.mode", "Toggle topic inspector and stream"),
     hidden(Activate, "view.activate", "Open selected"),
     hidden(ActivateBeside, "view.activate_beside", "Open selected beside"),
@@ -185,6 +189,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     c(LoadLayout, "layout.load", "Load a saved layout"),
     c(Plot, "view.plot", "Plot the selected field"),
     c(RecordBag, "bag.record", "Record a bag of every topic"),
+    c(PlayBag, "bag.play", "Play a bag back"),
     c(StartAgent, "bench.agent", "Start the micro-ROS agent"),
     c(Simulate, "bench.simulate", "Simulate a board or robot in firmware_simulator"),
     c(NewRobot, "bench.new_robot", "Build a robot file (several simulated boards)"),

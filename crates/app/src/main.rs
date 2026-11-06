@@ -1,6 +1,7 @@
 //! archon: a keyboard-driven native GUI for ROS 2 firmware testing.
 
 mod app;
+mod bags;
 mod bench;
 mod builder;
 mod bytes;
@@ -10,6 +11,7 @@ mod inspector;
 mod keymap;
 mod layout;
 mod logview;
+mod nodes;
 mod persist;
 mod picker;
 mod plot;
@@ -97,6 +99,8 @@ fn main() -> eframe::Result {
     }
 
     // An isolated window, and everything it starts, joins the network of a discovery server of its own
+    // A bench saved from an isolated window opens isolated again
+    let isolated = isolated || profile.isolated;
     let discovery = if isolated {
         match bench::free_discovery_port() {
             Some(port) => {

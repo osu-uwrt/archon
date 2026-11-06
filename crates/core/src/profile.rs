@@ -12,6 +12,10 @@ pub const FILE_NAME: &str = "archon.toml";
 #[derive(Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Run on a ROS network of the bench's own (a discovery server archon starts), as `--isolated` does: for a
+    /// second copy of a board whose topics would mix with the first's
+    #[serde(default)]
+    pub isolated: bool,
     /// Environment for every process, such as `RMW_IMPLEMENTATION`
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -106,6 +110,9 @@ pub struct CanSpec {
     pub interface: String,
     #[serde(default = "yes")]
     pub autostart: bool,
+    /// Say what each frame is in UWRT's CANmore terms (board, heartbeat, thrusters, micro-ROS); off for other buses
+    #[serde(default = "yes")]
+    pub canmore: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -211,6 +218,14 @@ impl Profile {
     /// Returns whether it was there.
     pub fn remove_from_file(path: &Path, name: &str) -> anyhow::Result<bool> {
         remove_tables(path, &["process", "serial", "can", "echo"], name)
+    }
+
+    /// Marks a profile file `isolated = true`, keeping the rest as it was (the key goes above every table)
+    pub fn mark_isolated(path: &Path) -> anyhow::Result<()> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("in {}", path.display()))?;
+        doc["isolated"] = toml_edit::value(true);
+        std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Takes the `[[publish]]` action named `name` out of a profile file, keeping the rest as it was
@@ -348,6 +363,18 @@ mod tests {
         let profile = Profile::load(&path).unwrap();
         assert!(profile.publishes.is_empty());
         assert_eq!(profile.processes.len(), 1, "a source of the same name stays");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn marks_a_file_isolated_above_its_tables() {
+        let path = std::env::temp_dir().join(format!("archon-isolated-{}.toml", std::process::id()));
+        std::fs::write(&path, "# my bench\n\n[[process]]\nname = \"agent\"\ncmd = \"a\"\n").unwrap();
+        Profile::mark_isolated(&path).unwrap();
+        let profile = Profile::load(&path).unwrap();
+        assert!(profile.isolated);
+        assert_eq!(profile.processes.len(), 1);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# my bench"));
         let _ = std::fs::remove_file(&path);
     }
 

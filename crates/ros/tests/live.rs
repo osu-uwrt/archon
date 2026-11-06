@@ -71,6 +71,14 @@ fn echoes_a_live_topic() {
     // The graph shows the topic and its type
     let found = wait_for("the topic on the graph", Duration::from_secs(20), || ros.graph().topic(&topic).cloned());
     assert_eq!(found.types, ["std_msgs/msg/String"]);
+    // The publisher's node, with the topic it publishes
+    wait_for("the publisher's node", Duration::from_secs(20), || {
+        ros.graph()
+            .nodes
+            .iter()
+            .find(|n| n.publishes.iter().any(|(t, ty)| *t == topic && ty == "std_msgs/msg/String"))
+            .cloned()
+    });
 
     // An echo finds the type itself, subscribes, and decodes
     let registry = Arc::new(Mutex::new(Registry::from_env()));
