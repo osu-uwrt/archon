@@ -68,7 +68,8 @@ The main area tiles into panes like vim windows, each showing one view:
 - **A topic inspector**: the latest message as a tree that updates in place. Changed fields flash and numbers get a
   sparkline. `v` cycles to the raw stream, then to the **bytes**: the last 500 messages as they arrived, the selected
   one in hex beside what it decodes to, or why it doesn't. `p` plots the selected field.
-- **A plot**: fields over time, live. `[` and `]` change how much time shows, `f` pauses (then drag and scroll to look
+- **A plot**: fields over time, live, each field in a color it keeps, with its value now and its range in the window;
+  hover a line for a value and how long ago it was. `[` and `]` change how much time shows, `f` pauses (then drag and scroll to look
   around), `Ctrl+L` clears.
 - **A publish form**: any topic's message as fields to fill in. `Ctrl+S` sends it, `Ctrl+R` sends it at the rate
   given, and Save to profile adds it as a `[[publish]]` action. A message waits (up to 2 s) for the topic's subscribers to find archon's

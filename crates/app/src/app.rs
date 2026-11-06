@@ -3621,11 +3621,13 @@ mod tests {
         {
             let state = h.state().topic_states[&2].clone();
             state.lock().unwrap().trace("linear_acceleration.z");
+            state.lock().unwrap().trace("linear_acceleration.x");
             for i in 0..150 {
                 let z = 9.8 + (f64::from(i) / 12.0).sin() * 0.4;
+                let x = 9.7 + (f64::from(i) / 7.0).cos() * 0.25;
                 let field = |n: &str, v| (n.to_owned(), v);
                 let accel = archon_msg::Value::Struct(vec![
-                    field("x", archon_msg::Value::Float64(0.01)),
+                    field("x", archon_msg::Value::Float64(x)),
                     field("y", archon_msg::Value::Float64(-0.02)),
                     field("z", archon_msg::Value::Float64(z)),
                 ]);
@@ -3644,6 +3646,12 @@ mod tests {
         keys(&mut h, "[");
         keys(&mut h, "[");
         save(&mut h, "plot");
+        // A second field joins the same plot
+        keys(&mut h, "alt+h");
+        keys(&mut h, "k k");
+        keys(&mut h, "p");
+        keys(&mut h, "alt+l");
+        save(&mut h, "plot-two");
 
         // The bytes of the last message, which didn't decode
         keys(&mut h, "alt+h");
