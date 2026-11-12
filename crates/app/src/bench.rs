@@ -198,6 +198,7 @@ pub fn can_ports() -> Vec<Port> {
 /// How to run the agent: a command to put the transport arguments after
 #[derive(Clone, Debug, PartialEq)]
 pub struct Agent {
+    pub kind: AgentKind,
     pub command: String,
     /// Where it was found, for saying so
     pub found: String,
@@ -210,16 +211,21 @@ const IN_WORKSPACE: &str = "install/lib/micro_ros_agent/micro_ros_agent";
 /// the usual places (`~/dev/*/micro-ros-agent`, `~/microros_ws`, ...)
 pub fn find_agent(configured: Option<&str>, home: &Path) -> Result<Agent, String> {
     if let Some(command) = configured {
-        return Ok(Agent { command: command.to_owned(), found: "the configured command".to_owned() });
+        return Ok(Agent {
+            kind: AgentKind::MicroRos,
+            command: command.to_owned(),
+            found: "the configured command".to_owned(),
+        });
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     if let Some(binary) = std::env::split_paths(&path).map(|d| d.join("micro_ros_agent")).find(|p| p.is_file()) {
-        return Ok(Agent { command: quote(&binary), found: binary.display().to_string() });
+        return Ok(Agent { kind: AgentKind::MicroRos, command: quote(&binary), found: binary.display().to_string() });
     }
     workspaces(home)
         .into_iter()
         .find(|ws| ws.join(IN_WORKSPACE).is_file())
         .map(|ws| Agent {
+            kind: AgentKind::MicroRos,
             // The workspace's setup puts its libraries on the path
             command: format!(
                 "source {} && exec {}",
@@ -246,8 +252,70 @@ fn workspaces(home: &Path) -> Vec<PathBuf> {
     roots.iter().flat_map(|root| names.iter().map(move |n| root.join(n))).collect()
 }
 
-/// The agent's command for a transport
+/// Whether ROS here goes over zenoh (`--zenoh`, or `zenoh = true` in the profile)
+pub fn zenoh_mode() -> bool {
+    std::env::var("RMW_IMPLEMENTATION").is_ok_and(|rmw| rmw == ZENOH_RMW)
+}
+
+pub const ZENOH_RMW: &str = "rmw_zenoh_cpp";
+/// Where rmw_zenoh's router listens by default
+pub const ZENOH_ROUTER_PORT: u16 = 7447;
+
+/// Which agent: micro-ROS (DDS-XRCE, to Fast DDS) or nano-ROS (its own protocol, to the ROS 2 RMW, zenoh included)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentKind {
+    MicroRos,
+    NanoRos,
+}
+
+impl AgentKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentKind::MicroRos => "micro-ROS",
+            AgentKind::NanoRos => "nano-ROS",
+        }
+    }
+}
+
+/// Finds osu-uwrt/nano_ros's host agent: the configured command, `nano_ros_agent` on the PATH, or built in a
+/// nano_ros checkout (`~/dev/*/nano_ros`, by colcon into install/ or by CMake into build/)
+pub fn find_nano_agent(configured: Option<&str>, home: &Path) -> Result<Agent, String> {
+    let agent = |command: String, found: String| Agent { kind: AgentKind::NanoRos, command, found };
+    if let Some(command) = configured {
+        return Ok(agent(command.to_owned(), "the configured command".to_owned()));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(binary) = std::env::split_paths(&path).map(|d| d.join("nano_ros_agent")).find(|p| p.is_file()) {
+        return Ok(agent(quote(&binary), binary.display().to_string()));
+    }
+    let mut checkouts = vec![home.join("dev/nano_ros"), home.join("nano_ros")];
+    checkouts
+        .extend(std::fs::read_dir(home.join("dev")).into_iter().flatten().flatten().map(|e| e.path().join("nano_ros")));
+    for checkout in checkouts.iter().filter(|c| c.is_dir()) {
+        let installed = checkout.join("install/nano_ros_agent/lib/nano_ros_agent/nano_ros_agent");
+        if installed.is_file() {
+            let setup = checkout.join("install/setup.bash");
+            return Ok(agent(
+                format!("source {} && exec {}", quote(&setup), quote(&installed)),
+                checkout.display().to_string(),
+            ));
+        }
+        let built = checkout.join("build/nano_ros_agent/nano_ros_agent");
+        if built.is_file() {
+            return Ok(agent(quote(&built), built.display().to_string()));
+        }
+    }
+    Err("no nano-ROS agent found: build nano_ros's nano_ros_agent, put nano_ros_agent on the PATH, or set \
+         nano_ros_agent = \"...\" in ~/.config/archon/config.toml"
+        .to_owned())
+}
+
+/// The agent's command for a transport. The nano-ROS agent takes a serial port and nothing else.
 pub fn agent_command(agent: &Agent, port: &Port) -> String {
+    if agent.kind == AgentKind::NanoRos {
+        let target = port.path().map(quote).unwrap_or_default();
+        return format!("{} {target}", agent.command);
+    }
     match port {
         Port::Serial(path) | Port::Simulated(path) => format!("{} serial --dev {}", agent.command, quote(path)),
         Port::Can(interface) => format!("{} can -D {interface}", agent.command),
@@ -274,6 +342,11 @@ pub struct Config {
     pub firmware_simulator: Option<PathBuf>,
     /// titan_firmware's upload_tool, for flashing boards
     pub upload_tool: Option<PathBuf>,
+    /// The command that runs nano_ros's host agent, before its port
+    pub nano_ros_agent: Option<String>,
+    /// The titan_firmware checkout: its builds, its upload_tool, its boards' fault names, and `${TITAN_FIRMWARE_DIR}`
+    /// in robot files
+    pub titan_firmware: Option<PathBuf>,
 }
 
 /// firmware_simulator's binary and its checkout, whose `boards/` describes each board
@@ -357,6 +430,11 @@ pub fn firmware_builds(home: &Path) -> Vec<Firmware> {
     roots.extend(
         std::fs::read_dir(home.join("dev")).into_iter().flatten().flatten().map(|e| e.path().join("titan_firmware")),
     );
+    builds_in(&roots)
+}
+
+/// The builds under these titan_firmware checkouts, newest first
+fn builds_in(roots: &[PathBuf]) -> Vec<Firmware> {
     let mut found = Vec::new();
     for root in roots.iter().filter(|r| r.is_dir()) {
         walk_for_images(root, 5, &mut found);
@@ -435,6 +513,57 @@ pub fn simulation_commands(
 }
 
 impl Config {
+    /// Where the settings live
+    pub fn file() -> Option<PathBuf> {
+        dirs::config_dir().map(|dir| dir.join("archon").join("config.toml"))
+    }
+
+    /// The titan_firmware checkout: `TITAN_FIRMWARE_DIR`, then the setting, then the first one found in the usual
+    /// places, with where it came from
+    pub fn titan_firmware(&self, home: &Path) -> Option<(PathBuf, &'static str)> {
+        if let Some(dir) = std::env::var_os("TITAN_FIRMWARE_DIR").map(PathBuf::from).filter(|d| d.is_dir()) {
+            return Some((dir, "from TITAN_FIRMWARE_DIR"));
+        }
+        if let Some(dir) = &self.titan_firmware {
+            return Some((dir.clone(), "set"));
+        }
+        crate::robot::titan_firmware_dir(home).map(|dir| (dir, "found"))
+    }
+
+    pub fn titan(&self, home: &Path) -> Option<PathBuf> {
+        self.titan_firmware(home).map(|(dir, _)| dir)
+    }
+
+    /// The firmware builds: the titan_firmware checkout's first, then any other checkout's, newest first
+    pub fn firmware_builds(&self, home: &Path) -> Vec<Firmware> {
+        let mut builds = self.titan(home).map(|dir| builds_in(&[dir])).unwrap_or_default();
+        for build in firmware_builds(home) {
+            if !builds.iter().any(|b| b.image == build.image) {
+                builds.push(build);
+            }
+        }
+        builds.sort_by_key(|f| std::cmp::Reverse(f.built));
+        builds
+    }
+
+    /// Sets one setting in a settings file (`None` takes it out), keeping the rest of the file as it was
+    pub fn save(file: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", file.display())),
+        };
+        let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{}: {e}", file.display()))?;
+        match value {
+            Some(value) => doc[key] = toml_edit::value(value),
+            None => _ = doc.remove(key),
+        }
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(file, doc.to_string()).map_err(|e| format!("{}: {e}", file.display()))
+    }
+
     pub fn load(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
@@ -529,10 +658,16 @@ mod tests {
     }
 
     #[test]
+    fn the_nano_ros_agent_takes_just_the_port() {
+        let agent = Agent { kind: AgentKind::NanoRos, command: "nano_ros_agent".into(), found: String::new() };
+        assert_eq!(agent_command(&agent, &Port::Serial("/dev/ttyACM0".into())), "nano_ros_agent /dev/ttyACM0");
+    }
+
+    #[test]
     fn simulation_waits_for_the_micro_ros_terminal() {
         let simulator = Simulator { binary: "/sim/target/release/firmware_simulator".into(), checkout: "/sim".into() };
         let firmware = Firmware { image: "/fw/IVCBoard2_with_bl.uf2".into(), name: "IVCBoard2".into(), built: None };
-        let agent = Agent { command: "agent".into(), found: String::new() };
+        let agent = Agent { kind: AgentKind::MicroRos, command: "agent".into(), found: String::new() };
         let (sim, agent, log) = simulation_commands(
             &simulator,
             &firmware,

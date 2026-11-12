@@ -78,6 +78,7 @@ pub fn show(
     entries: &[Entry],
     watches: &[Watch],
     sending: &[(usize, String)],
+    alerts: &[(SourceId, String, String)],
     unseen_errors: u64,
     graph: &str,
 ) -> Option<Click> {
@@ -112,6 +113,11 @@ pub fn show(
         for (index, label) in sending {
             if chip(ui, label, Health::Sending, "Click to open its form; Ctrl+R there stops it") {
                 click = Some(Click::Publisher(*index));
+            }
+        }
+        for (source, label, hover) in alerts {
+            if chip(ui, label, Health::Bad, hover) {
+                click = Some(Click::Source(*source));
             }
         }
         if unseen_errors > 0 {

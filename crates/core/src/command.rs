@@ -53,6 +53,7 @@ pub enum Command {
     OpenAllLogs,
     OpenTopics,
     OpenNodes,
+    OpenBoards,
     /// A topic: switch between the inspector and the raw stream
     ToggleStream,
     /// Open what's selected: an inspector branch, a topic in the table
@@ -87,6 +88,17 @@ pub enum Command {
     RecordBag,
     /// Play a recorded bag back onto the graph
     PlayBag,
+    /// Run a bench test from the bench's tests/ folder
+    RunTest,
+    /// Write every log, the topics, the graph and the boards to a folder
+    ExportSession,
+    /// The paths archon uses (titan_firmware, firmware_simulator, upload_tool, the agents), to see and set
+    OpenSettings,
+    SetTitanFirmware,
+    SetSimulator,
+    SetUploadTool,
+    SetMicroRosAgent,
+    SetNanoRosAgent,
 
     /// Run the micro-ROS agent on a port picked from a list
     StartAgent,
@@ -174,6 +186,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     c(OpenAllLogs, "open.logs", "Show all logs merged"),
     c(OpenTopics, "open.topics", "Show topics table"),
     c(OpenNodes, "open.nodes", "Show the nodes on the graph"),
+    c(OpenBoards, "open.boards", "Show each board's health"),
     c(ToggleStream, "view.mode", "Toggle topic inspector and stream"),
     hidden(Activate, "view.activate", "Open selected"),
     hidden(ActivateBeside, "view.activate_beside", "Open selected beside"),
@@ -190,6 +203,14 @@ pub const COMMANDS: &[CommandInfo] = &[
     c(Plot, "view.plot", "Plot the selected field"),
     c(RecordBag, "bag.record", "Record a bag of every topic"),
     c(PlayBag, "bag.play", "Play a bag back"),
+    c(RunTest, "test.run", "Run a bench test"),
+    c(ExportSession, "session.export", "Export the session (logs, topics, boards) to a folder"),
+    c(OpenSettings, "settings.paths", "Paths: titan_firmware, firmware_simulator, upload_tool, the agents"),
+    c(SetTitanFirmware, "settings.titan_firmware", "Set the titan_firmware folder"),
+    c(SetSimulator, "settings.firmware_simulator", "Set the firmware_simulator binary"),
+    c(SetUploadTool, "settings.upload_tool", "Set upload_tool (for flashing)"),
+    c(SetMicroRosAgent, "settings.micro_ros_agent", "Set the micro-ROS agent command"),
+    c(SetNanoRosAgent, "settings.nano_ros_agent", "Set the nano-ROS agent command"),
     c(StartAgent, "bench.agent", "Start the micro-ROS agent"),
     c(Simulate, "bench.simulate", "Simulate a board or robot in firmware_simulator"),
     c(NewRobot, "bench.new_robot", "Build a robot file (several simulated boards)"),

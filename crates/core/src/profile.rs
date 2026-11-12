@@ -16,6 +16,10 @@ pub struct Profile {
     /// second copy of a board whose topics would mix with the first's
     #[serde(default)]
     pub isolated: bool,
+    /// Run ROS over zenoh (rmw_zenoh_cpp) instead of DDS, with a router archon starts if there isn't one, as `--zenoh`
+    /// does. For nano-ROS boards; the micro-ROS agent only speaks DDS.
+    #[serde(default)]
+    pub zenoh: bool,
     /// Environment for every process, such as `RMW_IMPLEMENTATION`
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -35,9 +39,30 @@ pub struct Profile {
     /// Messages to publish, ready to send from the sidebar, the palette or a key
     #[serde(default, rename = "publish")]
     pub publishes: Vec<PublishSpec>,
+    /// Patterns to watch every source's output for
+    #[serde(default, rename = "trigger")]
+    pub triggers: Vec<TriggerSpec>,
     /// The file this was loaded from
     #[serde(skip)]
     pub path: Option<PathBuf>,
+}
+
+/// A pattern to watch for in the sources' output, like a watchdog reset
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerSpec {
+    /// A regex
+    pub matches: String,
+    /// What to call it in the health strip; the pattern if left out
+    pub name: Option<String>,
+    /// Only the sources whose name has this in it
+    pub source: Option<String>,
+    /// Stop following everywhere, so the moment stays on screen
+    #[serde(default)]
+    pub pause: bool,
+    /// Export the session (logs, topics, boards) when it goes off
+    #[serde(default)]
+    pub export: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

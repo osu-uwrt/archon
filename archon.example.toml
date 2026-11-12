@@ -1,6 +1,10 @@
 # Copy to archon.toml in the project you're testing (archon looks in the current directory and above),
 # or pass a path: archon path/to/bench.toml
 
+# Run on a ROS network of the bench's own (as --isolated does), or over zenoh (as --zenoh does)
+# isolated = true
+# zenoh = true
+
 # Environment for every process
 env = { RMW_IMPLEMENTATION = "rmw_fastrtps_cpp" }
 
@@ -44,3 +48,12 @@ key = "F2"
 # [[can]]
 # name = "bus"
 # interface = "can0"
+
+# A pattern to watch every source's output for: its chip in the health strip counts it, pause keeps the moment on
+# screen, export writes the session to sessions/
+# [[trigger]]
+# name = "watchdog"
+# matches = "(?i)watchdog reset"
+# source = "console"
+# pause = true
+# export = true

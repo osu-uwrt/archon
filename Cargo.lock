@@ -237,8 +237,10 @@ dependencies = [
  "egui_plot",
  "libc",
  "nucleo-matcher",
+ "regex",
  "serde",
  "toml 0.9.12+spec-1.1.0",
+ "toml_edit",
 ]
 
 [[package]]

@@ -35,6 +35,8 @@
                 paths = with pkgs.rosPackages.humble; [
                   ros-core
                   rosbag2
+                  # zenoh as the RMW (and its router), for nano-ROS boards
+                  rmw-zenoh-cpp
                   pkgs.uwrt.riptide-msgs
                 ];
               })

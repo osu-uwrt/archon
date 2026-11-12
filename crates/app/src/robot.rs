@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::bench::{Simulator, quote};
+use archon_core::profile::{ProcessSpec, RestartPolicy, SerialSpec};
+
+use crate::bench::{Agent, AgentKind, Port, Simulator, agent_command, quote};
 
 /// How a board's firmware reaches its micro-ROS agent
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +167,8 @@ pub fn transport(image: &Path) -> Transport {
 pub enum Attach {
     /// The agent on a board's micro-ROS terminal, once it appears
     Agent { name: String, path: PathBuf },
+    /// The nano-ROS agent on a board's serial port, once it appears
+    NanoAgent { name: String, path: PathBuf },
     /// A board's log
     Console { name: String, path: PathBuf },
     /// The agent the simulator hands a bus's micro-ROS sessions to
@@ -176,6 +180,7 @@ impl Attach {
     pub fn args(&self) -> [String; 2] {
         match self {
             Attach::Agent { name, path } => ["--agent".to_owned(), format!("{name}={}", path.display())],
+            Attach::NanoAgent { name, path } => ["--nano-agent".to_owned(), format!("{name}={}", path.display())],
             Attach::Console { name, path } => ["--console".to_owned(), format!("{name}={}", path.display())],
             Attach::UdpAgent { name, port } => ["--udp-agent".to_owned(), format!("{name}={port}")],
         }
@@ -187,12 +192,62 @@ impl Attach {
         let name = name.to_owned();
         match flag {
             "--agent" => Ok(Attach::Agent { name, path: rest.into() }),
+            "--nano-agent" => Ok(Attach::NanoAgent { name, path: rest.into() }),
             "--console" => Ok(Attach::Console { name, path: rest.into() }),
             "--udp-agent" => {
                 rest.parse().map(|port| Attach::UdpAgent { name, port }).map_err(|_| format!("{rest} isn't a port"))
             }
             _ => Err(format!("{flag} isn't an attach flag")),
         }
+    }
+}
+
+/// The source an attach opens, as a profile would write it
+pub enum Spec {
+    Process(ProcessSpec),
+    Serial(SerialSpec),
+}
+
+impl Attach {
+    /// The source this opens. `agent` finds an agent of a kind, when it's one; `named` makes the suggested name
+    /// (like "agent b_ivc") one that isn't taken.
+    pub fn spec(
+        &self,
+        agent: impl FnOnce(AgentKind) -> Result<Agent, String>,
+        named: impl FnOnce(&str) -> String,
+    ) -> Result<Spec, String> {
+        let process = |name: String, cmd: String| ProcessSpec {
+            name,
+            cmd,
+            cwd: None,
+            env: Default::default(),
+            autostart: true,
+            restart: RestartPolicy::OnFailure,
+        };
+        Ok(match self {
+            Attach::Console { name, path } => Spec::Serial(SerialSpec {
+                name: named(&format!("console {name}")),
+                port: path.display().to_string(),
+                baud: 115_200,
+                autostart: true,
+                line_ending: Default::default(),
+            }),
+            Attach::Agent { name, path } | Attach::NanoAgent { name, path } => {
+                let kind =
+                    if matches!(self, Attach::NanoAgent { .. }) { AgentKind::NanoRos } else { AgentKind::MicroRos };
+                // A simulated board's terminal appears once the simulator is up
+                let cmd = format!(
+                    "while [ ! -e {p} ]; do sleep 0.2; done; {}",
+                    agent_command(&agent(kind)?, &Port::Simulated(path.clone())),
+                    p = quote(path)
+                );
+                Spec::Process(process(named(&format!("agent {name}")), cmd))
+            }
+            Attach::UdpAgent { name, port } => Spec::Process(process(
+                named(&format!("agent {name}")),
+                agent_command(&agent(AgentKind::MicroRos)?, &Port::Udp(*port)),
+            )),
+        })
     }
 }
 
@@ -430,6 +485,7 @@ mod tests {
             Attach::Agent { name: "b_ivc".into(), path: "/tmp/x-ros".into() },
             Attach::Console { name: "b_ivc".into(), path: "/tmp/x-log".into() },
             Attach::UdpAgent { name: "internal".into(), port: 8890 },
+            Attach::NanoAgent { name: "led".into(), path: "/tmp/led".into() },
         ] {
             let [flag, value] = attach.args();
             assert_eq!(Attach::parse(&flag, &value).unwrap(), attach);

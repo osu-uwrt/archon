@@ -312,7 +312,7 @@ fn level_color(level: Level, visuals: &Visuals) -> Color32 {
 }
 
 /// Wall-clock time of day, `HH:MM:SS.mmm`
-fn clock(time: SystemTime) -> String {
+pub(crate) fn clock(time: SystemTime) -> String {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = since_epoch.as_secs() as libc::time_t;
     // SAFETY: localtime_r only writes the tm it's given

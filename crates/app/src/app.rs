@@ -127,7 +127,17 @@ pub struct ArchonApp {
     discovery: Option<u16>,
     /// The robot file being written, in its view
     builder: Option<crate::builder::Builder>,
+    settings: crate::settings::SettingsState,
+    /// Where settings are saved: ~/.config/archon/config.toml, or a test's own file
+    config_file: Option<PathBuf>,
     nodes: crate::nodes::NodesState,
+    /// The bench test running, or the last one run
+    test: Option<crate::benchtest::Runner>,
+    /// Each board's health, from its FirmwareStatus
+    boards: crate::boards::Boards,
+    /// The profile's triggers, and when each last exported the session
+    triggers: Vec<crate::triggers::Trigger>,
+    trigger_exports: HashMap<usize, Instant>,
     /// Flashes started here, so a finished one makes way for the next
     flashes: Vec<SourceId>,
     /// The line of each flash's output whose question has been put to the user
@@ -156,9 +166,13 @@ enum Pick {
     /// How much of a build to flash: the build's name, and its images
     FlashMode(String, Vec<(crate::flash::Mode, PathBuf)>),
     /// Where a second board's agent runs: here, or in an isolated window
-    AgentWhere(Port),
+    AgentWhere(Port, bench::AgentKind),
+    /// Which agent a serial port's board talks to
+    AgentKind(Port),
     /// A bag to play back
     Bag(Vec<crate::bags::Bag>),
+    /// A bench test to run
+    Test(Vec<crate::benchtest::TestFile>),
     /// Once or on a loop, for this bag
     BagLoop(crate::bags::Bag),
     /// The answer to upload_tool's question, for this flash: what to type for each choice
@@ -207,6 +221,7 @@ enum Deferred {
     Unplot(usize, usize),
     Run(Command),
     Builder(crate::builder::Action),
+    Settings(crate::settings::Action),
 }
 
 impl ArchonApp {
@@ -256,6 +271,7 @@ impl ArchonApp {
             }
             publishers.push(publisher);
         }
+        let titan = config.titan(&dirs::home_dir().unwrap_or_default());
         let mut app = Self {
             sup,
             keymap,
@@ -302,7 +318,13 @@ impl ArchonApp {
             discovery,
             simulated: Vec::new(),
             builder: None,
+            settings: Default::default(),
+            config_file: bench::Config::file(),
             nodes: Default::default(),
+            test: None,
+            triggers: Vec::new(),
+            trigger_exports: HashMap::new(),
+            boards: crate::boards::Boards::new(titan),
             flashes: Vec::new(),
             asked: HashMap::new(),
             #[cfg(test)]
@@ -317,6 +339,20 @@ impl ArchonApp {
                 problems.push(format!("can't echo {}: ROS isn't running ({why})", spec.topic));
             }
         }
+        // zenoh needs its router; one may be running already, from another window or a terminal
+        if bench::zenoh_mode() && std::net::TcpStream::connect(("127.0.0.1", bench::ZENOH_ROUTER_PORT)).is_err() {
+            let spec = archon_core::profile::ProcessSpec {
+                name: "zenoh router".to_owned(),
+                cmd: "exec \"$(ros2 pkg prefix rmw_zenoh_cpp)/lib/rmw_zenoh_cpp/rmw_zenohd\"".to_owned(),
+                cwd: None,
+                env: Default::default(),
+                autostart: true,
+                restart: RestartPolicy::OnFailure,
+            };
+            let source = archon_sources::process::ProcessSource::new(spec.clone(), &app.profile_env);
+            app.sup.add(&spec.name, Box::new(source), spec.restart, true, "\n");
+            app.grow_views();
+        }
         if let Some(port) = discovery {
             let spec = archon_core::profile::ProcessSpec {
                 name: "discovery".to_owned(),
@@ -330,6 +366,12 @@ impl ArchonApp {
             app.sup.add(&spec.name, Box::new(source), spec.restart, true, "\n");
             app.grow_views();
         }
+        for spec in &profile.triggers {
+            match crate::triggers::Trigger::new(spec.clone()) {
+                Ok(trigger) => app.triggers.push(trigger),
+                Err(why) => problems.push(why),
+            }
+        }
         app.sup.start_autostart();
         if let Some(saved) = app.state_file.as_deref().and_then(persist::load) {
             app.restore(saved);
@@ -341,7 +383,7 @@ impl ArchonApp {
         if let Some(image) = simulate {
             let home = dirs::home_dir().unwrap_or_default();
             if image.extension().is_some_and(|e| e == "toml") {
-                match crate::robot::load(&image, crate::robot::titan_firmware_dir(&home).as_deref()) {
+                match crate::robot::load(&image, app.config.titan(&home).as_deref()) {
                     Ok(robot) => app.simulate_robot(&robot),
                     Err(why) => app.flash(why, true),
                 }
@@ -548,9 +590,15 @@ impl ArchonApp {
             View::Topics => Some(&mut self.table.filter),
             View::AllLogs => Some(&mut self.merged.filter),
             View::Source(id) if id < self.views.len() => Some(&mut self.views[id].filter),
-            View::Source(_) | View::Publish(_) | View::Plot(_) | View::Welcome | View::RobotBuilder | View::Nodes => {
-                None
-            }
+            View::Source(_)
+            | View::Publish(_)
+            | View::Plot(_)
+            | View::Welcome
+            | View::RobotBuilder
+            | View::Nodes
+            | View::Test
+            | View::Boards
+            | View::Settings => None,
         }
     }
 
@@ -617,6 +665,7 @@ impl ArchonApp {
             Command::OpenAllLogs => self.show_view(View::AllLogs, false),
             Command::OpenTopics => self.show_view(View::Topics, false),
             Command::OpenNodes => self.show_view(View::Nodes, false),
+            Command::OpenBoards => self.show_view(View::Boards, false),
             Command::MeasureAll => {
                 self.table.measure_all = !self.table.measure_all;
                 let state = if self.table.measure_all { "measuring every topic's rate" } else { "stopped measuring" };
@@ -632,6 +681,14 @@ impl ArchonApp {
             Command::RunAction(n) => self.run_action(usize::from(n) - 1),
             Command::RecordBag => self.record_bag(),
             Command::PlayBag => self.pick_bag(),
+            Command::RunTest => self.pick_test(),
+            Command::ExportSession => self.export_session("exported by hand"),
+            Command::OpenSettings => self.show_view(View::Settings, false),
+            Command::SetTitanFirmware => self.open_setting(crate::settings::Setting::TitanFirmware),
+            Command::SetSimulator => self.open_setting(crate::settings::Setting::Simulator),
+            Command::SetUploadTool => self.open_setting(crate::settings::Setting::UploadTool),
+            Command::SetMicroRosAgent => self.open_setting(crate::settings::Setting::MicroRosAgent),
+            Command::SetNanoRosAgent => self.open_setting(crate::settings::Setting::NanoRosAgent),
             Command::StartAgent => self.pick_ports(true),
             Command::OpenSerial => self.pick_ports(false),
             Command::OpenCan => {
@@ -799,6 +856,16 @@ impl ArchonApp {
                 }
                 _ => {}
             },
+            View::Boards | View::Settings => {}
+            View::Test => match command {
+                Command::Restart => {
+                    if let Some(test) = self.test.as_ref().map(|r| r.test.clone()) {
+                        self.run_test(test);
+                    }
+                }
+                Command::Stop => self.stop_test(),
+                _ => {}
+            },
             View::Nodes => match command {
                 Command::ScrollDown => self.nodes.move_selection(&self.graph, 1),
                 Command::ScrollUp => self.nodes.move_selection(&self.graph, -1),
@@ -896,6 +963,120 @@ impl ArchonApp {
         dirs
     }
 
+    /// Goes through new output for the profile's triggers, and does what each one says when it goes off
+    fn watch_triggers(&mut self) {
+        if self.triggers.is_empty() {
+            return;
+        }
+        for hit in crate::triggers::scan(&mut self.triggers, &self.sup) {
+            let trigger = &self.triggers[hit.trigger];
+            let (label, pause, export) = (trigger.label(), trigger.spec.pause, trigger.spec.export);
+            let source = self.sup.entries()[hit.source].name.clone();
+            self.flash(format!("{label}: {source}: {}", hit.text), true);
+            if pause {
+                for view in &mut self.views {
+                    view.follow = false;
+                }
+                self.merged.follow = false;
+            }
+            // At most one export a trigger every few seconds, as a fault can repeat many times a second
+            let recent =
+                self.trigger_exports.get(&hit.trigger).is_some_and(|at| at.elapsed() < Duration::from_secs(10));
+            if export && !recent {
+                self.trigger_exports.insert(hit.trigger, Instant::now());
+                self.export_session(&format!("trigger {label} went off on {source}: {}", hit.text));
+            }
+        }
+    }
+
+    /// Writes the session to `sessions/` beside the bench
+    fn export_session(&mut self, why: &str) {
+        let bench = self.profile_path.as_deref().and_then(|p| p.parent()).map(PathBuf::from);
+        let dir = bench.or_else(|| std::env::current_dir().ok()).unwrap_or_default().join("sessions");
+        let session = crate::export::Session {
+            sup: &self.sup,
+            topics: &self.topic_states,
+            registry: &self.registry,
+            graph: &self.graph,
+            boards: &self.boards.boards,
+            profile: self.profile_path.as_deref(),
+        };
+        match crate::export::export(&dir, why, &session) {
+            Ok(folder) => self.flash(format!("exported the session to {}", folder.display()), false),
+            Err(e) => self.flash(format!("couldn't export to {}: {e}", dir.display()), true),
+        }
+    }
+
+    /// Lists the bench tests beside the bench, newest first
+    fn pick_test(&mut self) {
+        let tests = crate::benchtest::find(&self.bag_dirs());
+        if tests.is_empty() {
+            return self.flash("no bench tests: put them in tests/ beside archon.toml (see the README)", false);
+        }
+        let items = tests
+            .iter()
+            .map(|t| OptionItem {
+                label: t.title(),
+                detail: format!("{} steps · {}", t.steps.len(), t.path.display()),
+                hint: String::new(),
+            })
+            .collect();
+        self.picker = Some(Picker::options("Run which test?", items));
+        self.picking = Some(Pick::Test(tests));
+    }
+
+    /// Starts a bench test, bringing up the board or robot it simulates first if it isn't up yet
+    pub(crate) fn run_test(&mut self, test: crate::benchtest::TestFile) {
+        self.stop_test();
+        let home = dirs::home_dir().unwrap_or_default();
+        if let Some(robot) = &test.robot {
+            let running = self.sup.live().any(|(_, e)| e.name.starts_with("robot ") && e.status.is_active());
+            if !running {
+                match crate::robot::load(&test.resolve(robot), self.config.titan(&home).as_deref()) {
+                    Ok(robot) => self.simulate_robot(&robot),
+                    Err(why) => return self.flash(why, true),
+                }
+            }
+        }
+        if let Some(build) = &test.simulate {
+            let firmware = match crate::benchtest::firmware(build, &test, &self.config, &home) {
+                Ok(firmware) => firmware,
+                Err(why) => return self.flash(why, true),
+            };
+            let board = self.find_simulator().ok().and_then(|s| bench::board_for(&s, &firmware.image));
+            let running = self.simulated.iter().any(|(id, b)| {
+                let entry = &self.sup.entries()[*id];
+                Some(b) == board.as_ref() && !entry.removed && entry.status.is_active()
+            });
+            if !running {
+                self.simulate(&firmware);
+            }
+        }
+        self.test = Some(crate::benchtest::Runner::new(test));
+        self.show_view(View::Test, false);
+    }
+
+    fn stop_test(&mut self) {
+        let Some(runner) = &mut self.test else { return };
+        let link = self.ros.as_ref().ok().map(|l| l.ros.clone());
+        let bench = crate::benchtest::Bench { sup: &self.sup, ros: link.as_ref(), registry: &self.registry };
+        runner.stop(&bench);
+    }
+
+    fn poll_test(&mut self) {
+        let Some(runner) = &mut self.test else { return };
+        if runner.finished.is_some() {
+            return;
+        }
+        let link = self.ros.as_ref().ok().map(|l| l.ros.clone());
+        let bench = crate::benchtest::Bench { sup: &self.sup, ros: link.as_ref(), registry: &self.registry };
+        runner.poll(&bench);
+        if let Some(passed) = runner.passed() {
+            let title = runner.test.title();
+            self.flash(format!("{title}: {}", if passed { "passed" } else { "failed" }), !passed);
+        }
+    }
+
     /// Lists the bags to play, newest first
     fn pick_bag(&mut self) {
         if !crate::bags::available() {
@@ -977,58 +1158,34 @@ impl ArchonApp {
 
     /// Opens an agent or console for a board or bus, and starts it
     fn attach(&mut self, attach: &crate::robot::Attach) -> Option<SourceId> {
-        use crate::robot::Attach;
-        let process = |name: String, cmd: String| archon_core::profile::ProcessSpec {
-            name,
-            cmd,
-            cwd: None,
-            env: Default::default(),
-            autostart: true,
-            restart: RestartPolicy::OnFailure,
-        };
-        let spec = match attach {
-            Attach::Console { name, path } => {
-                let spec = archon_core::profile::SerialSpec {
-                    name: self.unique_name(&format!("console {name}")),
-                    port: path.display().to_string(),
-                    baud: 115_200,
-                    autostart: true,
-                    line_ending: Default::default(),
-                };
+        match attach.spec(|kind| self.find_agent_of(kind), |name| self.unique_name(name)) {
+            Ok(spec) => Some(self.add_spec(spec)),
+            Err(why) => {
+                self.flash(why, true);
+                None
+            }
+        }
+    }
+
+    /// Adds and starts a source opened here, which a saved bench keeps
+    fn add_spec(&mut self, spec: crate::robot::Spec) -> SourceId {
+        let id = match spec {
+            crate::robot::Spec::Serial(spec) => {
                 let source = archon_sources::serial::SerialSource::new(spec.clone());
                 let id = self.sup.add(&spec.name, Box::new(source), RestartPolicy::Never, true, "\n");
-                self.grow_views();
-                self.sup.start(id);
                 self.added.push(Added::Serial(spec));
-                return Some(id);
+                id
             }
-            Attach::Agent { name, .. } | Attach::UdpAgent { name, .. } => {
-                let agent = match self.find_agent() {
-                    Ok(agent) => agent,
-                    Err(why) => {
-                        self.flash(why, true);
-                        return None;
-                    }
-                };
-                let cmd = match attach {
-                    // A simulated board's terminal appears once the simulator is up
-                    Attach::Agent { path, .. } => format!(
-                        "while [ ! -e {p} ]; do sleep 0.2; done; {}",
-                        bench::agent_command(&agent, &Port::Simulated(path.clone())),
-                        p = bench::quote(path)
-                    ),
-                    Attach::UdpAgent { port, .. } => bench::agent_command(&agent, &Port::Udp(*port)),
-                    Attach::Console { .. } => unreachable!(),
-                };
-                process(self.unique_name(&format!("agent {name}")), cmd)
+            crate::robot::Spec::Process(spec) => {
+                let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
+                let id = self.sup.add(&spec.name, Box::new(source), spec.restart, true, "\n");
+                self.added.push(Added::Process(spec));
+                id
             }
         };
-        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
-        let id = self.sup.add(&spec.name, Box::new(source), spec.restart, true, "\n");
         self.grow_views();
         self.sup.start(id);
-        self.added.push(Added::Process(spec));
-        Some(id)
+        id
     }
 
     /// Runs a robot file: the simulator with every board, a console per C board, an agent for each USB board here
@@ -1248,7 +1405,10 @@ impl ArchonApp {
 
     /// Lists the ports to run the agent on (serial, CAN and UDP), or to open a console on (serial)
     fn pick_ports(&mut self, agent: bool) {
-        if agent && let Err(why) = self.find_agent() {
+        if agent
+            && let Err(why) = self.find_agent()
+            && self.find_agent_of(bench::AgentKind::NanoRos).is_err()
+        {
             self.flash(why, true);
             return;
         }
@@ -1287,8 +1447,8 @@ impl ArchonApp {
             Err(why) => return self.flash(why, true),
         };
         let home = dirs::home_dir().unwrap_or_default();
-        let robots = crate::robot::robots(&simulator, crate::robot::titan_firmware_dir(&home).as_deref());
-        let builds = bench::firmware_builds(&home);
+        let robots = crate::robot::robots(&simulator, self.config.titan(&home).as_deref());
+        let builds = self.config.firmware_builds(&home);
         if builds.is_empty() && robots.is_empty() {
             return self
                 .flash("no titan_firmware builds found (looked for *_with_bl.uf2 under ~/dev/*/titan_firmware)", true);
@@ -1339,7 +1499,7 @@ impl ArchonApp {
 
     fn flash_tool(&self) -> Result<crate::flash::Tool, String> {
         let home = dirs::home_dir().unwrap_or_default();
-        crate::flash::find(self.config.upload_tool.as_deref(), crate::robot::titan_firmware_dir(&home).as_deref())
+        crate::flash::find(self.config.upload_tool.as_deref(), self.config.titan(&home).as_deref())
     }
 
     /// Lists the builds to flash, with what each one is
@@ -1348,7 +1508,7 @@ impl ArchonApp {
             Ok(tool) => tool,
             Err(why) => return self.flash(why, true),
         };
-        let builds = bench::firmware_builds(&dirs::home_dir().unwrap_or_default());
+        let builds = self.config.firmware_builds(&dirs::home_dir().unwrap_or_default());
         if builds.is_empty() {
             return self
                 .flash("no titan_firmware builds found (looked for *_with_bl.uf2 under ~/dev/*/titan_firmware)", true);
@@ -1448,16 +1608,66 @@ impl ArchonApp {
     }
 
     /// The agent on a port, as a process
-    fn agent_spec(&mut self, port: &Port) -> Result<archon_core::profile::ProcessSpec, String> {
-        let agent = self.find_agent()?;
-        Ok(archon_core::profile::ProcessSpec {
+    fn find_agent_of(&self, kind: bench::AgentKind) -> Result<bench::Agent, String> {
+        let home = dirs::home_dir().unwrap_or_default();
+        match kind {
+            bench::AgentKind::MicroRos => bench::find_agent(self.config.micro_ros_agent.as_deref(), &home),
+            bench::AgentKind::NanoRos => bench::find_nano_agent(self.config.nano_ros_agent.as_deref(), &home),
+        }
+    }
+
+    /// Starts an agent on a port. With another agent running here, a serial board might be a second copy of one
+    /// already up, so `isolated` (asked, when it's `None`) sends it to an isolated window.
+    fn start_agent(&mut self, port: &Port, kind: bench::AgentKind, isolated: Option<bool>) {
+        if port.path().is_some() && isolated.is_none() && self.agent_running() {
+            let items = vec![
+                OptionItem {
+                    label: "Here".to_owned(),
+                    detail: "a different firmware from the board already here: their topics don't collide".to_owned(),
+                    hint: String::new(),
+                },
+                OptionItem {
+                    label: "In an isolated window".to_owned(),
+                    detail: "the same firmware as the board already here: their topics would mix".to_owned(),
+                    hint: self.key_of(Command::OpenIsolated).unwrap_or_default(),
+                },
+            ];
+            self.picker = Some(Picker::options("Another agent is running here. Where does this one go?", items));
+            self.picking = Some(Pick::AgentWhere(port.clone(), kind));
+            return;
+        }
+        if isolated == Some(true) {
+            let Some(path) = port.path() else { return };
+            let flag = match kind {
+                bench::AgentKind::MicroRos => "--agent",
+                bench::AgentKind::NanoRos => "--nano-agent",
+            };
+            self.open_window(vec!["--isolated".to_owned(), flag.to_owned(), format!("board={}", path.display())], true);
+            return self.flash(format!("{} runs its agent in an isolated window", port.label()), false);
+        }
+        let agent = match self.find_agent_of(kind) {
+            Ok(agent) => agent,
+            Err(why) => return self.flash(why, true),
+        };
+        let spec = archon_core::profile::ProcessSpec {
             name: self.unique_name("agent"),
             cmd: bench::agent_command(&agent, port),
             cwd: None,
             env: Default::default(),
             autostart: true,
             restart: RestartPolicy::OnFailure,
-        })
+        };
+        let name = spec.name.clone();
+        let id = self.add_spec(crate::robot::Spec::Process(spec));
+        self.show_view(View::Source(id), false);
+        let mut note = format!("started the {} agent as {name}; Space n w saves the bench", kind.name());
+        // The micro-ROS agent talks Fast DDS itself, whatever the RMW, so its boards don't reach a zenoh graph
+        if kind == bench::AgentKind::MicroRos && crate::bench::zenoh_mode() {
+            note = format!(
+                "{note}. This window is on zenoh, and the micro-ROS agent only speaks DDS: its topics won't show here"
+            );
+        }
+        self.flash(note, false);
     }
 
     /// Puts a question a flash is waiting on (which board? which interface?) to the user as a picker
@@ -1490,6 +1700,41 @@ impl ArchonApp {
         }
     }
 
+    /// Shows the paths, with the cursor in one setting's field
+    fn open_setting(&mut self, setting: crate::settings::Setting) {
+        self.settings.focus = Some(setting);
+        self.show_view(View::Settings, false);
+    }
+
+    /// Saves a setting to config.toml (or takes it out) and uses it from now on
+    fn change_setting(&mut self, action: crate::settings::Action) {
+        use crate::settings::Action;
+        let home = dirs::home_dir().unwrap_or_default();
+        let Some(file) = self.config_file.clone() else { return self.flash("there's no config folder here", true) };
+        let (setting, value) = match action {
+            Action::Save(setting, typed) => match setting.check(&typed, &home) {
+                Ok(value) => (setting, Some(value)),
+                Err(why) => {
+                    self.settings.said.insert(setting, Err(why));
+                    return;
+                }
+            },
+            Action::Clear(setting) => (setting, None),
+        };
+        match bench::Config::save(&file, setting.key(), value.as_deref()) {
+            Ok(()) => {
+                let note = match &value {
+                    Some(value) => format!("{} is {value} from now on", setting.title()),
+                    None => format!("{} is found again from now on", setting.title()),
+                };
+                setting.apply(&mut self.config, value);
+                self.settings.said.insert(setting, Ok(format!("saved in {}", file.display())));
+                self.flash(note, false);
+            }
+            Err(why) => _ = self.settings.said.insert(setting, Err(why)),
+        }
+    }
+
     /// Shows the robot file being written, starting one if there isn't one
     fn open_builder(&mut self) {
         let simulator = match self.find_simulator() {
@@ -1504,7 +1749,7 @@ impl ArchonApp {
 
     /// Lists the firmware builds to add to the robot being written
     fn pick_robot_board(&mut self) {
-        let builds = bench::firmware_builds(&dirs::home_dir().unwrap_or_default());
+        let builds = self.config.firmware_builds(&dirs::home_dir().unwrap_or_default());
         if builds.is_empty() {
             return self
                 .flash("no titan_firmware builds found (looked for *_with_bl.uf2 under ~/dev/*/titan_firmware)", true);
@@ -1534,7 +1779,7 @@ impl ArchonApp {
         let Some(builder) = &mut self.builder else { return };
         match builder.save(&home) {
             Err(why) => self.flash(why, true),
-            Ok(path) if run => match crate::robot::load(&path, crate::robot::titan_firmware_dir(&home).as_deref()) {
+            Ok(path) if run => match crate::robot::load(&path, self.config.titan(&home).as_deref()) {
                 Ok(robot) => self.simulate_robot(&robot),
                 Err(why) => self.flash(why, true),
             },
@@ -1646,46 +1891,43 @@ impl ArchonApp {
         let (spec, source): (Added, Box<dyn archon_core::source::Source>) = match pick {
             Pick::Agent(ports) => {
                 let Some(port) = ports.get(index).cloned() else { return };
-                // A second board's agent: the same firmware twice would mix topics here, so ask where it goes
-                if port.path().is_some() && self.agent_running() {
+                // On a serial port, either agent could be the one; ask when both are here
+                let nano = port.path().is_some() && self.find_agent_of(bench::AgentKind::NanoRos).is_ok();
+                let micro = self.find_agent().is_ok();
+                if nano && micro {
                     let items = vec![
                         OptionItem {
-                            label: "Here".to_owned(),
-                            detail: "a different firmware from the board already here: their topics don't collide"
-                                .to_owned(),
+                            label: "micro-ROS".to_owned(),
+                            detail: "titan_firmware's C boards (DDS-XRCE, onto Fast DDS)".to_owned(),
                             hint: String::new(),
                         },
                         OptionItem {
-                            label: "In an isolated window".to_owned(),
-                            detail: "the same firmware as the board already here: their topics would mix".to_owned(),
-                            hint: self.key_of(Command::OpenIsolated).unwrap_or_default(),
+                            label: "nano-ROS".to_owned(),
+                            detail: "a libnanoros board (onto the ROS 2 RMW, zenoh included)".to_owned(),
+                            hint: String::new(),
                         },
                     ];
-                    self.picker =
-                        Some(Picker::options("Another agent is running here. Where does this one go?", items));
-                    self.picking = Some(Pick::AgentWhere(port));
-                    return;
+                    self.picker = Some(Picker::options("Which agent does this board talk to?", items));
+                    self.picking = Some(Pick::AgentKind(port));
+                } else {
+                    let kind = if nano && !micro { bench::AgentKind::NanoRos } else { bench::AgentKind::MicroRos };
+                    self.start_agent(&port, kind, None);
                 }
-                match self.agent_spec(&port) {
-                    Ok(spec) => {
-                        let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
-                        (Added::Process(spec), Box::new(source))
-                    }
-                    Err(why) => return self.flash(why, true),
-                }
+                return;
             }
-            Pick::AgentWhere(port) if index == 0 => match self.agent_spec(&port) {
-                Ok(spec) => {
-                    let source = archon_sources::process::ProcessSource::new(spec.clone(), &self.profile_env);
-                    (Added::Process(spec), Box::new(source))
+            Pick::AgentKind(port) => {
+                let kind = if index == 1 { bench::AgentKind::NanoRos } else { bench::AgentKind::MicroRos };
+                self.start_agent(&port, kind, None);
+                return;
+            }
+            Pick::AgentWhere(port, kind) => {
+                self.start_agent(&port, kind, Some(index == 1));
+                return;
+            }
+            Pick::Test(tests) => {
+                if let Some(test) = tests.get(index).cloned() {
+                    self.run_test(test);
                 }
-                Err(why) => return self.flash(why, true),
-            },
-            Pick::AgentWhere(port) => {
-                let Some(path) = port.path() else { return };
-                let args = vec!["--isolated".to_owned(), "--agent".to_owned(), format!("board={}", path.display())];
-                self.open_window(args, true);
-                self.flash(format!("{} runs its agent in an isolated window", port.label()), false);
                 return;
             }
             Pick::Bag(bags) => {
@@ -2208,6 +2450,29 @@ impl ArchonApp {
             View::Plot(_) => {
                 ui.label(RichText::new("This plot is gone").weak());
             }
+            View::Boards => crate::boards::show(ui, pane, &mut self.boards),
+            View::Settings => {
+                let home = dirs::home_dir().unwrap_or_default();
+                if let Some(action) = crate::settings::show(ui, &mut self.settings, &self.config, &home) {
+                    self.deferred.push(Deferred::Settings(action));
+                }
+            }
+            View::Test => match &self.test {
+                Some(runner) => {
+                    let keys = [
+                        self.key_of(Command::Restart).unwrap_or_default(),
+                        self.key_of(Command::Stop).unwrap_or_default(),
+                    ];
+                    match crate::benchtest::show(ui, runner, [keys[0].as_str(), keys[1].as_str()]) {
+                        Some(crate::benchtest::ViewAction::RunAgain) => {
+                            self.deferred.push(Deferred::Run(Command::Restart))
+                        }
+                        Some(crate::benchtest::ViewAction::Stop) => self.deferred.push(Deferred::Run(Command::Stop)),
+                        None => {}
+                    }
+                }
+                None => _ = ui.label(RichText::new("No test has run yet (Space t runs one)").weak()),
+            },
             View::Nodes => {
                 let graph = self.graph.clone();
                 if let Some(crate::nodes::Action::OpenTopic(name, ty)) =
@@ -2276,6 +2541,7 @@ impl ArchonApp {
                 Deferred::Builder(crate::builder::Action::AddBoard) => self.pick_robot_board(),
                 Deferred::Builder(crate::builder::Action::Save) => self.save_robot(false),
                 Deferred::Builder(crate::builder::Action::SaveAndRun) => self.save_robot(true),
+                Deferred::Settings(action) => self.change_setting(action),
                 Deferred::ToggleBranch(id) => {
                     let _ = ctx;
                     let topic = self.topic_states[&id].clone();
@@ -2378,6 +2644,17 @@ impl ArchonApp {
             }
             View::Nodes => {
                 wanted.extend([(Command::ScrollDown, "pick"), (Command::OpenTopics, "topics")]);
+            }
+            View::Test => {
+                wanted.extend([
+                    (Command::Restart, "run again"),
+                    (Command::Stop, "stop"),
+                    (Command::RunTest, "another test"),
+                ]);
+            }
+            View::Settings => {}
+            View::Boards => {
+                wanted.extend([(Command::OpenNodes, "nodes"), (Command::OpenTopics, "topics")]);
             }
             View::RobotBuilder => {
                 wanted.extend([
@@ -2584,6 +2861,7 @@ impl ArchonApp {
     /// The ROS link, for the right end of the health strip
     fn graph_label(&self) -> String {
         match &self.ros {
+            Ok(_) if bench::zenoh_mode() => format!("zenoh · router :{}", bench::ZENOH_ROUTER_PORT),
             Ok(_) if let Ok(server) = std::env::var("ROS_DISCOVERY_SERVER") => {
                 let own = if self.discovery.is_some() { "isolated" } else { "discovery server" };
                 format!("{own} {server}")
@@ -2606,7 +2884,16 @@ impl ArchonApp {
             .filter(|(_, p)| p.repeating)
             .map(|(i, p)| (i, format!("sending {} {} Hz", p.name, p.rate_text.trim())))
             .collect();
-        let click = health::show(ui, self.sup.entries(), &self.watches, &sending, self.unseen_errors(), &label);
+        let alerts: Vec<(SourceId, String, String)> = self
+            .triggers
+            .iter()
+            .filter_map(|t| {
+                let (source, line) = t.last.clone()?;
+                Some((source, format!("{} ×{}", t.label(), t.hits), format!("last: {}", line.trim())))
+            })
+            .collect();
+        let click =
+            health::show(ui, self.sup.entries(), &self.watches, &sending, &alerts, self.unseen_errors(), &label);
         let ctx = ui.ctx().clone();
         match click {
             Some(health::Click::Source(id)) => self.show_view(View::Source(id), false),
@@ -2808,8 +3095,9 @@ impl ArchonApp {
                 }
                 View::AllLogs => PaneSpec::AllLogs,
                 View::Topics => PaneSpec::Topics,
-                View::Welcome | View::RobotBuilder => PaneSpec::Welcome,
+                View::Welcome | View::RobotBuilder | View::Test | View::Settings => PaneSpec::Welcome,
                 View::Nodes => PaneSpec::Nodes,
+                View::Boards => PaneSpec::Boards,
                 View::Publish(i) => {
                     let p = &self.publishers[i];
                     PaneSpec::Publish { name: p.name.clone(), topic: p.topic.clone(), ty: p.ty.clone() }
@@ -2853,6 +3141,7 @@ impl ArchonApp {
                 PaneSpec::AllLogs => View::AllLogs,
                 PaneSpec::Topics => View::Topics,
                 PaneSpec::Nodes => View::Nodes,
+                PaneSpec::Boards => View::Boards,
                 PaneSpec::Welcome => View::Welcome,
                 PaneSpec::Plot { series, seconds } => {
                     let mut plot = Plot::new();
@@ -2981,6 +3270,15 @@ impl eframe::App for ArchonApp {
         self.poll_watchers();
         self.send_repeating(&ctx);
         self.answer_flash_questions();
+        self.poll_test();
+        let news = match &self.ros {
+            Ok(link) => self.boards.poll(&link.ros, &self.graph, &link.registry),
+            Err(_) => Vec::new(),
+        };
+        for news in news {
+            self.flash(news, true);
+        }
+        self.watch_triggers();
         if !self.watches.is_empty() || self.table.measure_all {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -3071,6 +3369,8 @@ mod tests {
             };
             ArchonApp::new(cc, startup)
         });
+        harness.state_mut().config_file =
+            Some(std::env::temp_dir().join(format!("archon-test-config-{}.toml", std::process::id())));
         harness.run_steps(2);
         harness
     }
@@ -3825,8 +4125,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let profile = Profile { path: Some(path.clone()), ..Profile::default() };
         // A stand-in agent that says what it was asked to do
-        let config =
-            bench::Config { micro_ros_agent: Some("echo agent".into()), firmware_simulator: None, upload_tool: None };
+        let config = bench::Config { micro_ros_agent: Some("echo agent".into()), ..Default::default() };
         let mut h = Harness::builder().with_size(vec2(1200.0, 700.0)).build_eframe(move |cc| {
             ArchonApp::new(
                 cc,
@@ -3849,6 +4148,10 @@ mod tests {
             app.picking =
                 Some(Pick::Agent(vec![Port::Serial("/dev/serial/by-id/usb-board-if02".into()), Port::Udp(8888)]));
             app.picked(0);
+            // Where nano_ros is built it asks which agent: micro-ROS
+            if matches!(app.picking, Some(Pick::AgentKind(_))) {
+                app.picked(0);
+            }
             app.picking = Some(Pick::Serial(vec![Port::Serial("/dev/archon-test-missing".into())]));
             app.picked(0);
         }
@@ -3964,6 +4267,15 @@ mod tests {
         }
         let console = h.state().sup.entries()[2].buffer.total();
         println!("console lines: {console}");
+        // The board's FirmwareStatus fills in the boards view
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !h.state().boards.boards.iter().any(|b| b.name == "talos/ivc_board" && !b.silent()) {
+            assert!(Instant::now() < deadline, "the IVC board never reported");
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let board = h.state().boards.boards.iter().find(|b| b.name == "talos/ivc_board").unwrap();
+        println!("boards: {} {} up {}", board.name, board.state(), crate::boards::uptime(board.uptime_ms));
 
         for id in 0..3 {
             h.state_mut().remove_source(id, false);
@@ -4514,17 +4826,23 @@ mod tests {
                 Port::Serial("/dev/serial/by-id/usb-b-if02".into()),
             ]
         };
-        h.state_mut().picking = Some(Pick::Agent(ports()));
-        h.state_mut().picked(0);
+        // Where nano_ros is built, it asks which agent first: micro-ROS
+        let pick = |h: &mut Harness<'static, ArchonApp>, index: usize| {
+            h.state_mut().picking = Some(Pick::Agent(ports()));
+            h.state_mut().picked(index);
+            if matches!(h.state().picking, Some(Pick::AgentKind(_))) {
+                h.state_mut().picked(0);
+            }
+        };
+        pick(&mut h, 0);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !h.state().agent_running() {
             assert!(Instant::now() < deadline);
             h.run_steps(1);
             std::thread::sleep(Duration::from_millis(50));
         }
-        h.state_mut().picking = Some(Pick::Agent(ports()));
-        h.state_mut().picked(1);
-        assert!(matches!(h.state().picking, Some(Pick::AgentWhere(_))), "asks where");
+        pick(&mut h, 1);
+        assert!(matches!(h.state().picking, Some(Pick::AgentWhere(_, _))), "asks where");
         h.state_mut().picked(1);
         assert_eq!(h.state().spawned.last().unwrap(), &["--isolated", "--agent", "board=/dev/serial/by-id/usb-b-if02"]);
         let agents =
@@ -4532,8 +4850,7 @@ mod tests {
         assert_eq!(agents(&h), 1, "not here");
 
         // Different firmware: here
-        h.state_mut().picking = Some(Pick::Agent(ports()));
-        h.state_mut().picked(1);
+        pick(&mut h, 1);
         h.state_mut().picked(0);
         assert_eq!(agents(&h), 2);
         h.state_mut().sup.stop_all();
@@ -4549,6 +4866,191 @@ mod tests {
         assert_eq!(h.state().nodes.selected.as_deref(), Some("/talos/esc_board"));
         use egui_kittest::kittest::Queryable;
         h.get_by_label("/talos/state/kill");
+    }
+
+    /// Space t lists the bench's tests, and the one picked runs in the Test view
+    #[test]
+    fn space_t_runs_a_bench_test() {
+        let dir = std::env::temp_dir().join(format!("archon-bench-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("tests/boots.toml"),
+            "name = \"boots\"\n[[step]]\nlog = \"ready\"\nsource = \"board\"\nwithin = \"5s\"\n[[step]]\nno_log = \"ERROR\"\nfor = \"300ms\"\n",
+        )
+        .unwrap();
+        // It keeps saying it's ready, so the step hears it however long the window takes to start the test
+        let mut h = harness_with(
+            "[[process]]\nname = \"board\"\ncmd = \"while true; do echo ready; sleep 0.2; done\"\nautostart = true\n",
+        );
+        h.state_mut().profile_path = Some(dir.join("archon.toml"));
+        keys(&mut h, "space t");
+        assert!(h.state().picker.is_some(), "lists the tests");
+        press(&mut h, Modifiers::NONE, Key::Enter);
+        assert_eq!(h.state().layout.active_view(), View::Test);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.state().test.as_ref().unwrap().finished.is_none() {
+            assert!(Instant::now() < deadline, "{:?}", h.state().test.as_ref().unwrap().states);
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(h.state().test.as_ref().unwrap().passed(), Some(true));
+        use egui_kittest::kittest::Queryable;
+        h.run_steps(2);
+        h.get_by_label(" PASSED ");
+        h.state_mut().sup.stop_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trigger goes off on a watchdog reset: it's in the health strip, following stops, and the session is exported
+    #[test]
+    fn a_trigger_pauses_and_exports() {
+        let dir = std::env::temp_dir().join(format!("archon-trigger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A profile file, so the bench's folder (where the export goes) is known from the start
+        let path = dir.join("archon.toml");
+        std::fs::write(
+            &path,
+            "[[process]]\nname = \"board\"\ncmd = \"sleep 0.2; echo 'Clean Boot: Watchdog reset'; sleep 30\"\nautostart = true\n\
+             [[trigger]]\nname = \"watchdog\"\nmatches = \"(?i)watchdog\"\npause = true\nexport = true\n",
+        )
+        .unwrap();
+        let profile = Profile::load(&path).unwrap();
+        let mut h = Harness::builder().with_size(vec2(1200.0, 700.0)).build_eframe(move |cc| {
+            let startup = Startup {
+                profile,
+                keymap: Keymap::defaults(),
+                problems: Vec::new(),
+                with_ros: false,
+                state_file: None,
+                config: Default::default(),
+                discovery: None,
+                simulate: None,
+                attach: Vec::new(),
+            };
+            ArchonApp::new(cc, startup)
+        });
+        h.run_steps(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.state().triggers[0].hits == 0 {
+            assert!(Instant::now() < deadline, "the trigger never went off");
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(h.state().triggers[0].hits, 1, "the started note quotes the command, but doesn't count");
+        assert!(!h.state().views[0].follow, "following stopped");
+        let exports: Vec<_> = std::fs::read_dir(dir.join("sessions")).unwrap().flatten().collect();
+        assert_eq!(exports.len(), 1);
+        let readme = std::fs::read_to_string(exports[0].path().join("README.txt")).unwrap();
+        assert!(readme.contains("trigger watchdog went off on board"), "{readme}");
+        use egui_kittest::kittest::Queryable;
+        h.run_steps(2);
+        h.get_by_label(" watchdog ×1 ");
+        h.state_mut().sup.stop_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In zenoh mode archon starts the router and sees a topic published over zenoh. Run alone, since it sets the
+    /// RMW for this process: `cargo test -p archon over_zenoh -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sees_a_topic_over_zenoh() {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: run alone, before ROS starts
+        unsafe { std::env::set_var("RMW_IMPLEMENTATION", bench::ZENOH_RMW) };
+        let mut h = Harness::builder().with_size(vec2(1200.0, 700.0)).build_eframe(move |cc| {
+            let startup = Startup {
+                profile: Profile::default(),
+                keymap: Keymap::defaults(),
+                problems: Vec::new(),
+                with_ros: true,
+                state_file: None,
+                config: Default::default(),
+                discovery: None,
+                simulate: None,
+                attach: Vec::new(),
+            };
+            ArchonApp::new(cc, startup)
+        });
+        h.run_steps(2);
+        assert!(h.state().sup.live().any(|(_, e)| e.name == "zenoh router"), "starts the router");
+        assert!(h.state().graph_label().starts_with("zenoh"), "{}", h.state().graph_label());
+        let topic = format!("/archon_zenoh_{}", std::process::id());
+        let mut publisher = std::process::Command::new("ros2")
+            .args(["topic", "pub", "-r", "5", &topic, "std_msgs/msg/String", "{data: over zenoh}"])
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while h.state().graph.topic(&topic).is_none() {
+            assert!(Instant::now() < deadline, "never saw {topic} over zenoh");
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("saw {topic} over zenoh: {:?}", h.state().graph.topic(&topic));
+        // SAFETY: signalling the process group this test started
+        unsafe { libc::killpg(publisher.id() as i32, libc::SIGINT) };
+        let _ = publisher.wait();
+        h.state_mut().sup.stop_all();
+    }
+
+    /// The nano-ROS agent, found in a nano_ros checkout and started the way the agent picker starts it, stays up on
+    /// a serial port, waiting for its board. `cargo test -p archon nano_ros_agent -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn starts_the_nano_ros_agent() {
+        let mut h = harness_with("");
+        if h.state().find_agent_of(bench::AgentKind::NanoRos).is_err() {
+            return println!("no nano_ros agent here");
+        }
+        // A terminal with nothing on the other end, as a board's port before the board says anything
+        let (mut leader, mut follower) = (0, 0);
+        // SAFETY: openpty fills in two descriptors
+        assert_eq!(
+            unsafe {
+                libc::openpty(&mut leader, &mut follower, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+            },
+            0
+        );
+        let port = std::fs::read_link(format!("/proc/self/fd/{follower}")).unwrap();
+        h.state_mut().start_agent(&Port::Serial(port.clone()), bench::AgentKind::NanoRos, Some(false));
+        let id = h.state().sup.live().find(|(_, e)| e.name.starts_with("agent")).map(|(id, _)| id).unwrap();
+        for _ in 0..30 {
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let entry = &h.state().sup.entries()[id];
+        let said: Vec<&str> = entry.buffer.iter().map(|l| l.text.as_str()).collect();
+        println!("{:?}\n{}", entry.status, said.join("\n"));
+        assert!(said[0].contains("nano_ros_agent") && said[0].contains(&port.display().to_string()), "{said:?}");
+        assert_eq!(entry.status, archon_core::source::Status::Running, "still up, waiting for its board");
+        h.state_mut().sup.stop_all();
+        // SAFETY: closing what openpty opened
+        unsafe {
+            libc::close(leader);
+            libc::close(follower);
+        }
+    }
+
+    /// From the palette, set the titan_firmware folder: it's saved in the settings file and used from then on
+    #[test]
+    fn sets_the_titan_firmware_folder() {
+        let dir = std::env::temp_dir().join(format!("archon-titan-setting-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut h = harness_with("");
+        let file = dir.join("config.toml");
+        h.state_mut().config_file = Some(file.clone());
+        keys(&mut h, "ctrl+shift+p");
+        type_text(&mut h, "Set the titan_firmware folder");
+        press(&mut h, Modifiers::NONE, Key::Enter);
+        assert_eq!(h.state().layout.active_view(), View::Settings);
+        h.run_steps(2);
+        type_text(&mut h, &dir.display().to_string());
+        press(&mut h, Modifiers::NONE, Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().config.titan_firmware.as_deref(), Some(dir.as_path()));
+        assert_eq!(bench::Config::load(&file).unwrap().titan_firmware.as_deref(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4686,6 +5188,55 @@ mod tests {
         keys(&mut h, "N");
         keys(&mut h, "j");
         save(&mut h, "nodes");
+        keys(&mut h, "escape");
+        // Each board's health
+        {
+            let now = Instant::now();
+            let board = |name: &str, client, uptime_ms, faults, asserting, reboots, heard: Option<Instant>| {
+                crate::boards::Board {
+                    name: name.into(),
+                    client_id: client,
+                    bus_id: 0,
+                    topic: "/talos/state/firmware".into(),
+                    uptime_ms,
+                    faults,
+                    kill_enabled: 1,
+                    kill_asserting: asserting,
+                    version: "1.0 (release)".into(),
+                    heard,
+                    reboots,
+                    rebooted: (reboots > 0).then_some(now),
+                    ..Default::default()
+                }
+            };
+            h.state_mut().boards.boards = vec![
+                board("talos/ivc_board", 8, 4_123_000, 0, 0, 0, Some(now)),
+                board("mk2/esc_board", 2, 41_000, 0b1001, 1, 1, Some(now)),
+                board("mk2/power_board", 1, 95_000, 0, 0, 0, now.checked_sub(Duration::from_secs(12))),
+            ];
+        }
+        keys(&mut h, "B");
+        save(&mut h, "boards");
+        // A bench test that failed partway
+        {
+            let path = std::env::temp_dir().join("archon-screenshot-test.toml");
+            std::fs::write(&path, "name = \"IVC kill switch\"\nsimulate = \"IVCBoard2\"\n[[step]]\nwait = \"/talos/heartbeat\"\n[[step]]\npublish = \"/talos/state/kill\"\ntype = \"std_msgs/msg/Bool\"\nvalue = { data = true }\n[[step]]\nexpect = \"/talos/state/firmware\"\nfield = \"kill_switches_asserting_kill\"\nabove = 0\n[[step]]\nno_log = \"(?i)fault\"\nfor = \"2s\"\n").unwrap();
+            let mut runner = crate::benchtest::Runner::new(crate::benchtest::TestFile::load(&path).unwrap());
+            use crate::benchtest::State;
+            runner.states = vec![
+                State::Passed(Duration::from_millis(2010)),
+                State::Passed(Duration::from_millis(3)),
+                State::Failed("no message on /talos/state/firmware in 10.0 s met it; the last: kill_switches_asserting_kill was 0".into()),
+                State::Skipped,
+            ];
+            runner.finished = Some(Duration::from_millis(12_400));
+            h.state_mut().test = Some(runner);
+        }
+        h.state_mut().show_view(View::Test, false);
+        save(&mut h, "bench-test");
+        // The paths archon uses
+        keys(&mut h, "space c");
+        save(&mut h, "paths");
         keys(&mut h, "escape");
         // A second field joins the same plot
         keys(&mut h, "alt+h");

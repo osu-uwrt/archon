@@ -83,6 +83,17 @@ With nothing set up, archon opens on **Getting started**:
 `F1` shows that page again. `archon path/to/bench.toml` runs a particular profile, and
 [examples/demo.toml](examples/demo.toml) is a bench that needs no hardware.
 
+## Paths
+
+archon finds the tools it uses on its own: the titan_firmware checkout (`~/dev/*/titan_firmware`),
+firmware_simulator (`~/dev/*/firmware_simulator/target/release`), upload_tool (in titan_firmware's `tools/`), and the
+micro-ROS and nano-ROS agents (on the PATH or built in a workspace). To use another, `Space c` (or **Paths** in
+Ctrl+P) shows each one, what archon uses now and where that came from, with a field to set it; the palette has a
+command for each too, like **Set the titan_firmware folder**. Settings are saved in `~/.config/archon/config.toml`
+(`titan_firmware`, `firmware_simulator`, `upload_tool`, `micro_ros_agent`, `nano_ros_agent`), and **Find it again**
+takes one out. For titan_firmware, the `TITAN_FIRMWARE_DIR` environment variable wins when it's set; the setting
+comes next, and it's what robot files' `${TITAN_FIRMWARE_DIR}` means when the variable isn't set.
+
 ## Profiles
 
 A profile is one test bench: the processes, ports and topics to bring up together. Save the bench from inside archon
@@ -153,6 +164,89 @@ closes the bag properly. `Space B` plays one back (once or on a loop), listing t
 archon runs in, newest first, with their length and message count. Both need rosbag2, which archon's `nix develop`
 has (the uwrt `ros` shell alone doesn't).
 
+- **Boards** (`B`): each titan_firmware board's health, from the `riptide_msgs2/msg/FirmwareStatus` it publishes:
+  OK, FAULT, KILLED, REBOOTED or SILENT; uptime, faults by name, kill switch state, version, and reboots (its uptime
+  going back). Fault names come from the board's titan_firmware project (the one whose `CMakeLists.txt` sets that
+  `PICO_BOARD`), from its `safety_interface.h`; the watchdog ones are named everywhere. A reboot or a new fault says
+  so at the bottom of the window whatever's on screen.
+
+## Bench tests
+
+A bench test is a file of steps run against the bench: hear a topic, publish to one, expect a value, see a line on
+a console, see no errors for a while. Put them in `tests/` beside `archon.toml`; `Space t` lists them and runs the
+one picked in the **Test** view, step by step (`r` runs it again, `x` stops it). The same file runs headless, for CI
+against firmware_simulator:
+
+```sh
+archon test tests/kill_switch.toml
+```
+
+It prints each step as it finishes and exits 1 if one fails, with the end of every source's output to see why.
+
+```toml
+name = "IVC kill switch"
+simulate = "IVCBoard2"        # a build to simulate first (or robot = "robots/x.toml", or bench = "../archon.toml")
+within = "10s"                # each step's time unless it says
+
+[[step]]
+wait = "/talos/heartbeat"     # any message
+within = "60s"
+
+[[step]]
+publish = "/talos/state/kill"
+type = "std_msgs/msg/Bool"
+value = { data = true }
+
+[[step]]
+expect = "/talos/state/firmware"
+field = "kill_switches_asserting_kill"
+above = 0                     # or below, equals, matches (a regex)
+
+[[step]]
+log = "Kill switch"           # a regex, in any source's output (source = "console" narrows it)
+
+[[step]]
+no_log = "(?i)fault|panic"
+for = "2s"
+
+[[step]]
+sleep = "500ms"
+```
+
+[examples/tests/ivc_kill_switch.toml](examples/tests/ivc_kill_switch.toml) is that test, and passes against
+titan_firmware's IVCBoard2 in firmware_simulator.
+
+## Triggers and session exports
+
+`[[trigger]]`s in the profile watch every source's output for a pattern. When one goes off, its chip in the health
+strip says how many times and jumps to where; `pause = true` stops following everywhere so the moment stays on
+screen, and `export = true` exports the session.
+
+```toml
+[[trigger]]
+name = "watchdog"
+matches = "(?i)watchdog reset"   # a regex
+source = "console"               # only these sources (part of the name); all of them if left out
+pause = true
+export = true
+```
+
+`Space e` exports the session by hand: a folder in `sessions/` beside the bench with every source's log, the merged
+log, each echoed topic's recent messages (decoded), the graph, the boards, and the bench file, with a README saying
+when and why. Attach it to a bug report as it is.
+
+## zenoh and nano-ROS
+
+`archon --zenoh` (or `zenoh = true` in the profile) runs ROS over zenoh (`rmw_zenoh_cpp`): archon's node and
+everything it starts, with a zenoh router it starts as a source if there isn't one on port 7447. The health strip
+says "zenoh". It's for nano-ROS boards: nano_ros's host agent is a ROS 2 node, so it follows the RMW, whereas the
+micro-ROS agent speaks Fast DDS itself, so micro-ROS boards don't show on a zenoh graph (archon says so when you
+start one there).
+
+archon finds nano_ros's agent like the micro-ROS one: on the PATH, built in a nano_ros checkout
+(`~/dev/*/nano_ros`), or `nano_ros_agent = "..."` in `~/.config/archon/config.toml`. When both agents are there,
+starting one on a serial port asks which the board talks to. (nano_ros_agent only has a serial transport so far.)
+
 ## Keys
 
 The bottom bar always shows the keys that matter right now. `?` lists them all, and pressing `Space` waits for the
@@ -194,6 +288,10 @@ rest of a sequence with a menu of what can follow.
 | `F1` | Getting started |
 | `Space l s` / `Space l l` | Save the layout under a name / load one |
 | `Space b` / `Space B` | Record a bag of every topic / play one back |
+| `Space t` | Run a bench test |
+| `Space e` | Export the session to `sessions/` |
+| `Space c` | The paths archon uses, and setting them |
+| `B` | Each board's health |
 | `Ctrl+=` / `Ctrl+-` | Zoom |
 | `Ctrl+B` | Toggle the sidebar |
 | `Ctrl+Q` | Quit |
@@ -286,5 +384,6 @@ real graph, publishing with `ros2 topic pub` on domain 77, localhost only.
    drag-and-drop panes; named layouts~~
 5. ~~The node graph, bag playback, decoding UWRT's CANmore frames~~; firmware_simulator boards and robots,
    flashing, isolated ROS networks for duplicate boards
-6. Service calls and parameters: a request form per service type (the publish form's machinery, for `.srv`
-   requests), and reading and setting a node's parameters
+6. ~~Bench tests (in the window and headless), board health, triggers and session exports, zenoh and nano-ROS~~
+7. Service calls and parameters: a request form per service type (the publish form's machinery, for `.srv`
+   requests), and reading and setting a node's parameters; the robot computer over SSH, and an arm64 release

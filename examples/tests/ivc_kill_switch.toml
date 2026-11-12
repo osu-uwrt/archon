@@ -1,0 +1,30 @@
+# The kill switch on a simulated IVCBoard2: archon simulates the build, waits for the board's micro-ROS node,
+# sends a kill and checks the board reports it. Run it with `archon test examples/tests/ivc_kill_switch.toml`, or
+# from the window with Space t (from a bench whose tests/ folder has it).
+name = "IVC kill switch"
+simulate = "IVCBoard2"
+within = "10s"
+
+[[step]]
+wait = "/talos/heartbeat"
+within = "60s"
+
+[[step]]
+expect = "/talos/state/firmware"
+field = "kill_switches_asserting_kill"
+equals = 0
+
+[[step]]
+publish = "/talos/state/kill"
+type = "std_msgs/msg/Bool"
+value = { data = true }
+
+[[step]]
+expect = "/talos/state/firmware"
+field = "kill_switches_asserting_kill"
+above = 0
+within = "5s"
+
+[[step]]
+no_log = "(?i)hard ?fault|panic|watchdog"
+for = "2s"

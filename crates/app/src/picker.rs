@@ -388,6 +388,8 @@ fn source_items(sources: &[Entry], topics: &[Topic], keymap: &Keymap) -> Vec<Ite
         (View::AllLogs, "All logs", "every source merged in time order", Command::OpenAllLogs),
         (View::Topics, "Topics", "the table of every topic, with rates", Command::OpenTopics),
         (View::Nodes, "Nodes", "every node, and what it publishes and subscribes to", Command::OpenNodes),
+        (View::Boards, "Boards", "each board's uptime, faults and kill switch", Command::OpenBoards),
+        (View::Settings, "Paths", "titan_firmware, firmware_simulator, upload_tool, the agents", Command::OpenSettings),
     ]
     .map(|(view, label, detail, command)| Item {
         choice: Choice::View { view, beside: false },

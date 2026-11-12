@@ -19,6 +19,8 @@ toml.workspace = true
 serde.workspace = true
 dirs.workspace = true
 libc.workspace = true
+regex = "1"
+toml_edit.workspace = true
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }

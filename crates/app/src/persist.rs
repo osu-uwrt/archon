@@ -31,6 +31,7 @@ pub enum PaneSpec {
     AllLogs,
     Topics,
     Nodes,
+    Boards,
     Welcome,
     Publish {
         name: String,

@@ -22,6 +22,12 @@ pub enum View {
     RobotBuilder,
     /// The nodes on the graph and what each one has
     Nodes,
+    /// The bench test running, or the last one
+    Test,
+    /// Each board's health, from its FirmwareStatus
+    Boards,
+    /// The paths archon uses, and setting them
+    Settings,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

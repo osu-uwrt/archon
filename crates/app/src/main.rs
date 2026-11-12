@@ -3,9 +3,13 @@
 mod app;
 mod bags;
 mod bench;
+mod benchtest;
+mod boards;
 mod builder;
 mod bytes;
+mod export;
 mod flash;
+mod headless;
 mod health;
 mod inspector;
 mod keymap;
@@ -18,8 +22,10 @@ mod plot;
 mod publish;
 mod rainbow;
 mod robot;
+mod settings;
 mod sidebar;
 mod topics;
+mod triggers;
 mod welcome;
 
 use std::path::PathBuf;
@@ -27,15 +33,21 @@ use std::path::PathBuf;
 use archon_core::profile::Profile;
 
 const USAGE: &str = "\
-usage: archon [--no-ros] [--isolated] [--simulate IMAGE|ROBOT] [--agent NAME=PORT] [--console NAME=PORT] [PROFILE]
+usage: archon [--no-ros] [--isolated] [--zenoh] [--simulate IMAGE|ROBOT] [--agent NAME=PORT] [--console NAME=PORT] [PROFILE]
+
+       archon test [--no-ros] FILE
 
 Runs the test bench in PROFILE, or in the nearest archon.toml in this directory or above.
+`archon test FILE` runs a bench test without the window: it brings up the test's bench, prints each step as it
+finishes, and exits 1 if one fails.
 --no-ros          leaves out the ROS graph (topics and echoes).
 --isolated        runs on a ROS network of this window's own (a Fast DDS discovery server it starts), so two boards
                   with the same topics, each in its own window, don't mix. Without PROFILE it starts empty.
+--zenoh           runs ROS over zenoh (rmw_zenoh_cpp), starting a router if there isn't one: for nano-ROS boards.
+                  The micro-ROS agent only speaks DDS, so micro-ROS boards don't show on zenoh.
 --simulate IMAGE  simulates a firmware build (a *_with_bl.uf2), or a firmware_simulator robot file (a .toml), on
                   start, as Space n f does.
---agent NAME=PORT, --console NAME=PORT, --udp-agent NAME=UDP_PORT
+--agent NAME=PORT, --nano-agent NAME=PORT, --console NAME=PORT, --udp-agent NAME=UDP_PORT
                   run a micro-ROS agent on a serial port (waiting for it to appear), open a console on one, or run
                   an agent on a UDP port; repeatable. A robot's isolated windows are opened with these.
 Keybindings can be changed in ~/.config/archon/keymap.toml.";
@@ -47,13 +59,21 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let with_ros = !args.iter().any(|a| a == "--no-ros");
+    if args.first().is_some_and(|a| a == "test") {
+        let Some(file) = args.iter().skip(1).find(|a| !a.starts_with("--")) else {
+            eprintln!("archon test needs a test file\n\n{USAGE}");
+            std::process::exit(2);
+        };
+        std::process::exit(headless::run(std::path::Path::new(file), with_ros));
+    }
     let isolated = args.iter().any(|a| a == "--isolated");
-    args.retain(|a| a != "--no-ros" && a != "--isolated");
+    let zenoh = args.iter().any(|a| a == "--zenoh");
+    args.retain(|a| a != "--no-ros" && a != "--isolated" && a != "--zenoh");
     // The flags that take a value
     let (mut simulate, mut attach, mut rest) = (None, Vec::new(), Vec::new());
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
-        if !matches!(arg.as_str(), "--simulate" | "--agent" | "--console" | "--udp-agent") {
+        if !matches!(arg.as_str(), "--simulate" | "--agent" | "--nano-agent" | "--console" | "--udp-agent") {
             rest.push(arg);
             continue;
         }
@@ -101,6 +121,26 @@ fn main() -> eframe::Result {
     // An isolated window, and everything it starts, joins the network of a discovery server of its own
     // A bench saved from an isolated window opens isolated again
     let isolated = isolated || profile.isolated;
+    // ROS over zenoh: archon's node, and everything it starts
+    let zenoh = zenoh || profile.zenoh;
+    if zenoh {
+        if std::env::var("RMW_IMPLEMENTATION").is_ok_and(|rmw| rmw != bench::ZENOH_RMW) {
+            problems.push(format!(
+                "RMW_IMPLEMENTATION was {}; zenoh asks for {}, so that's what's used",
+                std::env::var("RMW_IMPLEMENTATION").unwrap_or_default(),
+                bench::ZENOH_RMW
+            ));
+        }
+        // SAFETY: no other threads exist yet
+        unsafe { std::env::set_var("RMW_IMPLEMENTATION", bench::ZENOH_RMW) };
+        if isolated {
+            problems.push(
+                "isolated windows use their own DDS discovery server, which zenoh doesn't: this window is on zenoh's \
+                 network"
+                    .to_owned(),
+            );
+        }
+    }
     let discovery = if isolated {
         match bench::free_discovery_port() {
             Some(port) => {
